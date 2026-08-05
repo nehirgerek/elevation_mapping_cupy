@@ -111,7 +111,7 @@ step_height:
   layer_name: "step_height"
   extra_params:
     input_layer_name: "inpaint"
-    critical_value: 0.06
+    critical_value: 0.04
     # first_window: local height-range probe, ~3x3 cells (unchanged). second_window: widened
     # to ~0.4m (~50-cell disk) to cover the rover's full circumscribed radius (0.392m) rather
     # than just its half-width (0.24m), so the "is this step spatially extensive" check
@@ -132,7 +132,7 @@ traversability_step:
   layer_name: "traversability_step"
   extra_params:
     input_layer_name: "inpaint"
-    critical_value: 0.06
+    critical_value: 0.04
     first_window_radius: 0.15
     second_window_radius: 0.4
     critical_cell_number: 4
@@ -188,7 +188,7 @@ occupancy:
     # well above typical good-observation values and well below the "basically unobserved"
     # range, but has not been validated against real recorded variance distributions --
     # revisit once real-world variance histograms are available.
-    maximum_variance: 10.0
+    maximum_variance: 20.0
     lethal_traversability_threshold: 0.30
     inpaint_only_is_unknown: True
 
