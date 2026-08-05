@@ -40,7 +40,7 @@
     save_map_storage_id: 'mcap'
     service_namespace: '/elevation_mapping_cupy'
 
-    max_ray_length: 10.0                            # maximum length for ray tracing.
+    max_ray_length: 20.0                            # maximum length for ray tracing.
     cleanup_step: 0.1                               # subtitute this value from validity layer at visibiltiy cleanup.
     cleanup_cos_thresh: 0.1                         # subtitute this value from validity layer at visibiltiy cleanup.
 

@@ -198,8 +198,12 @@ class ElevationMappingNode(Node):
             ('occupancy_grid_layer', 'occupancy'),
             ('occupancy_grid_fps', 5.0),
             ('occupancy_grid_enable', True),
-            ('esdf_grid_topic', 'traversability_esdf'),
-            ('esdf_grid_root_relative', False),
+            # 'esdf_2d_topic' matches Mighty's existing subscription (mighty_node.cpp:
+            # sub_esdf_2d_, logged as "ESDF: Subscribed to esdf_2d_topic (d_safe=...)").
+            # Same root-relative reasoning as occ_2d_topic above -- NOTE: if global_mapper_ros
+            # or another source also publishes esdf_2d_topic, only run one at a time.
+            ('esdf_grid_topic', 'esdf_2d_topic'),
+            ('esdf_grid_root_relative', True),
             ('esdf_grid_layer', 'esdf_encoded'),
             ('esdf_grid_fps', 5.0),
             ('esdf_grid_enable', True),
