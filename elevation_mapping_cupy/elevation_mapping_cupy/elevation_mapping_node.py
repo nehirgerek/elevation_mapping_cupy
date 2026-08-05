@@ -21,6 +21,7 @@ import tf2_py as tf2
 from rclpy.duration import Duration
 from rclpy.serialization import serialize_message, deserialize_message
 from grid_map_msgs.msg import GridMap
+from nav_msgs.msg import OccupancyGrid
 from grid_map_msgs.srv import SetGridMap, ProcessFile
 from geometry_msgs.msg import Vector3, Quaternion
 from std_msgs.msg import Float32MultiArray
@@ -132,6 +133,7 @@ class ElevationMappingNode(Node):
         self.initialize_elevation_mapping()
         self.register_subscribers()
         self.register_publishers()
+        self.register_occupancy_publishers()
         self.register_timers()
         self.register_services()
         self._last_t = None
@@ -175,6 +177,45 @@ class ElevationMappingNode(Node):
         self.cupy_memory_pool_trim_interval_s = float(
             self.get_parameter('cupy_memory_pool_trim_interval_s').value
         )
+        # Tri-state occupancy grid and ESDF outputs for Mighty (traversability_occupancy /
+        # traversability_esdf plugins). Off by default's not needed here -- the plugins
+        # themselves only run if enabled in a loaded plugin config file (see
+        # extra_plugin_config_file); these publishers just no-op (KeyError caught, skipped)
+        # if their source layer was never computed. enable flags let you turn off the
+        # publishers specifically even if the layers happen to be computed for other reasons.
+        for name, default in (
+            # 'occ_2d_topic' matches Mighty's existing subscription (mighty_node.cpp:
+            # sub_occ_2d_, "binary 2D occupancy for A* planning"), the same topic name
+            # global_mapper_ros's occ_2d_pub_ already publishes. Publishing as a plain
+            # relative name (see occupancy_grid_root_relative below) lets ROS2's own
+            # namespace prefixing land it on the exact same resolved topic Mighty already
+            # listens to -- no Mighty-side changes needed. NOTE: if global_mapper_ros is
+            # also running and publishing occ_2d_topic, you now have two publishers on one
+            # topic (same failure mode as the duplicate-DLIO issue) -- only run one source
+            # of occ_2d_topic at a time.
+            ('occupancy_grid_topic', 'occ_2d_topic'),
+            ('occupancy_grid_root_relative', True),
+            ('occupancy_grid_layer', 'occupancy'),
+            ('occupancy_grid_fps', 5.0),
+            ('occupancy_grid_enable', True),
+            ('esdf_grid_topic', 'traversability_esdf'),
+            ('esdf_grid_root_relative', False),
+            ('esdf_grid_layer', 'esdf_encoded'),
+            ('esdf_grid_fps', 5.0),
+            ('esdf_grid_enable', True),
+        ):
+            if not self.has_parameter(name):
+                self.declare_parameter(name, default)
+        self.occupancy_grid_topic = self.get_parameter('occupancy_grid_topic').get_parameter_value().string_value
+        self.occupancy_grid_root_relative = bool(self.get_parameter('occupancy_grid_root_relative').value)
+        self.occupancy_grid_layer = self.get_parameter('occupancy_grid_layer').get_parameter_value().string_value
+        self.occupancy_grid_fps = float(self.get_parameter('occupancy_grid_fps').value)
+        self.occupancy_grid_enable = bool(self.get_parameter('occupancy_grid_enable').value)
+        self.esdf_grid_topic = self.get_parameter('esdf_grid_topic').get_parameter_value().string_value
+        self.esdf_grid_root_relative = bool(self.get_parameter('esdf_grid_root_relative').value)
+        self.esdf_grid_layer = self.get_parameter('esdf_grid_layer').get_parameter_value().string_value
+        self.esdf_grid_fps = float(self.get_parameter('esdf_grid_fps').value)
+        self.esdf_grid_enable = bool(self.get_parameter('esdf_grid_enable').value)
         self.initialize_tf_grid_size = self.get_parameter('initialize_tf_grid_size').get_parameter_value().double_value
         self.map_acquire_fps = self.get_parameter('map_acquire_fps').get_parameter_value().double_value
         self.publish_statistics_fps = self.get_parameter('publish_statistics_fps').get_parameter_value().double_value
@@ -210,6 +251,11 @@ class ElevationMappingNode(Node):
             plugin_config_file = self.get_parameter("plugin_config_file").get_parameter_value().string_value
             assert plugin_config_file
             self.param.plugin_config_file = plugin_config_file
+        if self.has_parameter("extra_plugin_config_file"):
+            # Optional: a second plugin config merged on top of plugin_config_file. Empty
+            # (default) disables it -- unlike plugin_config_file, no assert-non-empty here.
+            extra_plugin_config_file = self.get_parameter("extra_plugin_config_file").get_parameter_value().string_value
+            self.param.extra_plugin_config_file = extra_plugin_config_file
         if self.has_parameter("weight_file"):
             weight_file = self.get_parameter("weight_file").get_parameter_value().string_value
             assert weight_file
@@ -405,7 +451,14 @@ class ElevationMappingNode(Node):
         self._publishers_timers = []
 
         for pub_key, pub_config in self.my_publishers.items():
-            topic_name = f"/{self.get_name()}/{pub_key}"
+            # get_name() is just the base node name and does not include the
+            # namespace, so building the topic from it hardcodes an absolute
+            # topic that bypasses ROS2's namespace prefixing -- under
+            # namespace=<quad> this collided across robots (all quads
+            # published to the same /elevation_mapping_node/<pub_key>
+            # topic). get_fully_qualified_name() already includes the
+            # namespace and a leading slash.
+            topic_name = f"{self.get_fully_qualified_name()}/{pub_key}"
             publisher = self.create_publisher(GridMap, topic_name, 10)
             self._publishers_dict[pub_key] = publisher
 
@@ -415,6 +468,99 @@ class ElevationMappingNode(Node):
                 partial(self.publish_map, key=pub_key)
             )
             self._publishers_timers.append(timer)
+
+    def register_occupancy_publishers(self) -> None:
+        """Publish the tri-state occupancy classification and the Mighty-encoded ESDF as
+        nav_msgs/OccupancyGrid, for the geometric traversability pipeline (see
+        plugins/traversability_occupancy.py and plugins/traversability_esdf.py).
+
+        Topics are placed under this node's fully-qualified name (same reasoning as
+        register_publishers' GridMap topics: an unqualified name would collide across
+        multiple robots under namespace=<quad>), rather than at the bare root-level
+        `/traversability_occupancy` path the task spec names -- this repo's multi-robot
+        convention takes precedence; see the config file's header comment.
+        """
+        self._occupancy_publishers = {}
+        self._occupancy_timers = []
+        if self.occupancy_grid_enable:
+            # Plain relative name -> ROS2 applies only this node's own namespace (e.g.
+            # /RR08/occ_2d_topic), matching how global_mapper_ros's occ_2d_pub_ and Mighty's
+            # sub_occ_2d_ both resolve it -- NOT nested under this node's own name.
+            topic_name = (
+                self.occupancy_grid_topic if self.occupancy_grid_root_relative
+                else f"{self.get_fully_qualified_name()}/{self.occupancy_grid_topic}"
+            )
+            publisher = self.create_publisher(OccupancyGrid, topic_name, 10)
+            self._occupancy_publishers[self.occupancy_grid_layer] = publisher
+            timer = self.create_timer(
+                1.0 / self.occupancy_grid_fps,
+                partial(self.publish_occupancy_grid, layer_name=self.occupancy_grid_layer)
+            )
+            self._occupancy_timers.append(timer)
+        if self.esdf_grid_enable:
+            topic_name = (
+                self.esdf_grid_topic if self.esdf_grid_root_relative
+                else f"{self.get_fully_qualified_name()}/{self.esdf_grid_topic}"
+            )
+            publisher = self.create_publisher(OccupancyGrid, topic_name, 10)
+            self._occupancy_publishers[self.esdf_grid_layer] = publisher
+            timer = self.create_timer(
+                1.0 / self.esdf_grid_fps,
+                partial(self.publish_occupancy_grid, layer_name=self.esdf_grid_layer)
+            )
+            self._occupancy_timers.append(timer)
+
+    def publish_occupancy_grid(self, layer_name: str) -> None:
+        if self._map_q is None:
+            return
+        publisher = self._occupancy_publishers.get(layer_name)
+        if publisher is None or publisher.get_subscription_count() == 0:
+            return
+        try:
+            self._map.get_map_with_name_ref(layer_name, self._map_data)
+        except KeyError:
+            # The source plugin layer doesn't exist (e.g. extra_plugin_config_file wasn't
+            # set, so the traversability pipeline was never loaded). Nothing to publish yet.
+            return
+
+        # get_map_with_name_ref (called above) unconditionally applies
+        # ElevationMap._transform_to_grid_map_coordinate_convention (transpose + flip both
+        # axes) to whatever it fetches -- that transform exists purely to match
+        # grid_map_msgs/GridMap's own storage convention (row/col -> -X/-Y, see
+        # elevation_mapping.py:798-843) and encode_layer_to_multiarray's own additional
+        # transpose. It is NOT the convention nav_msgs/OccupancyGrid wants.
+        #
+        # nav_msgs/OccupancyGrid expects plain row-major data with row=Y increasing and
+        # col=X increasing from info.origin (the bottom-left corner) -- which is exactly
+        # this repo's own *raw* internal convention (kernels/custom_kernels.py get_x_idx/
+        # get_y_idx: idx = (coord-center)/resolution + ..., no sign flip, row=Y, col=X).
+        # So: undo the grid_map transform get_map_with_name_ref applied, via its documented
+        # inverse (flip axis 0, flip axis 1, transpose -- see
+        # ElevationMap._transform_to_elevation_mapping_coordinate_convention), to get back
+        # to that raw convention before building the OccupancyGrid.
+        raw = np.flip(np.flip(self._map_data, 0), 1).T
+        data = np.round(raw).astype(np.int8)
+
+        center = self._get_map_center()
+        resolution = self._map.resolution
+        height, width = data.shape
+        actual_map_length_x = width * resolution
+        actual_map_length_y = height * resolution
+
+        msg = OccupancyGrid()
+        msg.header.frame_id = self.map_frame
+        msg.header.stamp = self._last_t if self._last_t is not None else self.get_clock().now().to_msg()
+        msg.info.resolution = float(resolution)
+        msg.info.width = int(width)
+        msg.info.height = int(height)
+        # nav_msgs/OccupancyGrid's origin is the pose of cell (0,0), i.e. the map's
+        # bottom-left corner, unlike grid_map_msgs/GridMap's info.pose (map center).
+        msg.info.origin.position.x = float(center[0]) - actual_map_length_x / 2.0
+        msg.info.origin.position.y = float(center[1]) - actual_map_length_y / 2.0
+        msg.info.origin.position.z = 0.0
+        msg.info.origin.orientation.w = 1.0
+        msg.data = data.flatten().tolist()
+        publisher.publish(msg)
 
     def register_timers(self) -> None:
         self.time_pose_update = self.create_timer(

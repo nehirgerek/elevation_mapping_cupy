@@ -1,0 +1,69 @@
+# Robot-config for feeding elevation_mapping_cupy from DLIO's deskewed
+# point cloud (already motion-corrected and expressed in the fixed odom
+# frame -- no per-point sensor model needed, same reasoning as the
+# ANYbotics elevation_mapping (C++) DLIO config).
+#
+# Uses the `/**:` wildcard node-name key (not the absolute `/elevation_mapping_node:`
+# key core_param.yaml/menzi's base.yaml use) so this file works correctly
+# whether the node is launched at the root namespace or under `namespace=quad`
+# -- ROS2 only applies an absolute-keyed params file to a node whose fully
+# qualified name matches EXACTLY, so `/elevation_mapping_node:` would
+# silently no-op under `/RR08/elevation_mapping_node`. elevation_mapping_dlio.launch.py
+# additionally loads this (and core_param.yaml, which does NOT use the
+# wildcard) as a flattened Python dict rather than a raw file path, which
+# sidesteps the same issue for core_param.yaml too -- see that launch
+# file's own comment for why (mirrors the identical workaround already
+# established in acl-mapping's global_mapper_travel.launch.py for
+# travel_ros's non-wildcard kitti_params.yaml).
+#
+# topic_name/map_frame/base_frame/corrected_map_frame below are placeholders:
+# elevation_mapping_dlio.launch.py overrides all of them based on its `quad`
+# launch argument before passing this to the node.
+/**:
+  ros__parameters:
+    subscribers:
+      dlio_cloud:
+        topic_name: 'dlio/odom_node/pointcloud/deskewed'
+        data_type: pointcloud
+
+    map_frame: 'odom'
+    base_frame: 'base_link'
+    corrected_map_frame: 'odom'
+
+    # This GPU (verified during setup: compute capability 6.1, e.g. a
+    # GTX 10-series card) predates the compute capabilities PyTorch's
+    # default published wheels ship compiled kernels for (sm_75+) --
+    # use_chainer:true (the alternative traversability-filter backend) was
+    # tried as a workaround but chainer is unmaintained upstream and
+    # cannot be installed at all on Python 3.12 (its numpy.distutils
+    # import requires the `distutils` stdlib module, removed in Python
+    # 3.12). Left at the upstream default (false, torch-backed) --
+    # verified empirically that constructing/running it on this GPU does
+    # NOT crash (see this branch's investigation notes); the core
+    # cupy-based elevation/height computation is unaffected either way --
+    # cupy's own prebuilt kernels did work on this GPU. Revisit if
+    # traversability output looks wrong on real data, or once running on
+    # newer (Turing/sm_75+ or later) hardware.
+    use_chainer: false
+
+    publishers:
+      elevation_map_raw:
+        layers: ['elevation', 'variance']
+        basic_layers: ['elevation']
+        fps: 5.0
+      elevation_map_inpainted:
+        layers: ['inpaint']
+        basic_layers: ['inpaint']
+        fps: 5.0
+      # Geometric traversability pipeline outputs (see
+      # config/core/traversability_plugin_config.yaml). Only populated when
+      # extra_plugin_config_file is set (elevation_mapping_dlio.launch.py sets it
+      # unconditionally; each stage still has its own enable:true/false there).
+      # geom_traversability/terrain_cost, not "traversability" -- see that file's
+      # header comment on the pre-existing name collision with the torch-based filter.
+      elevation_map_traversability:
+        layers: ['surface_normal_x', 'surface_normal_y', 'surface_normal_z',
+                 'traversability_slope', 'roughness', 'traversability_roughness',
+                 'step_height', 'traversability_step', 'geom_traversability', 'terrain_cost']
+        basic_layers: ['geom_traversability']
+        fps: 5.0

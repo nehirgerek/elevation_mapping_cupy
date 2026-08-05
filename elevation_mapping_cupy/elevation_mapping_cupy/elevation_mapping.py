@@ -150,7 +150,10 @@ class ElevationMap:
 
         # Plugins
         self.plugin_manager = PluginManager(cell_n=self.cell_n, resolution=self.resolution)
-        self.plugin_manager.load_plugin_settings(param.plugin_config_file)
+        plugin_config_files = [param.plugin_config_file]
+        if getattr(param, "extra_plugin_config_file", ""):
+            plugin_config_files.append(param.extra_plugin_config_file)
+        self.plugin_manager.load_plugin_settings(plugin_config_files)
 
         self.map_initializer = MapInitializer(self.initial_variance, param.initialized_variance, xp=cp, method="points")
 

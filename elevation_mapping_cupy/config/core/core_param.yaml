@@ -5,7 +5,7 @@
     checker_layer: 'elevation'                # layer name for checking the validity of the cell.
     initialized_variance: 10.0                     # initial variance for each cell.    
     resolution: 0.1                                # resolution in m.  
-    map_length: 20.0                                 # map's size in m.
+    map_length: 40.0                                 # map's size in m.
     sensor_noise_factor: 0.05                       # point noise ~ sensor_noise_factor * range^2 in the sensor frame (range^2 = x^2+y^2+z^2).
     mahalanobis_thresh: 2.0                         # points outside this distance is outlier.
     outlier_variance: 0.01                          # if point is outlier, add this value to the cell.
@@ -23,7 +23,7 @@
     position_lowpass_alpha: 0.2                     # lowpass filter alpha used for detecting movements.
     orientation_lowpass_alpha: 0.2                  # lowpass filter alpha used for detecting movements.
     min_valid_distance: 0.1                         # points with shorter distance will be filtered out.
-    max_height_range: 10.5                          # points higher than this value from sensor will be filtered out to disable ceiling.
+    max_height_range: 0.5                          # points higher than this value from sensor will be filtered out to disable ceiling.
     ramped_height_range_a: 0.3                      # if z > max(d - ramped_height_range_b, 0) * ramped_height_range_a + ramped_height_range_c, reject.
     ramped_height_range_b: 1.0                      # if z > max(d - ramped_height_range_b, 0) * ramped_height_range_a + ramped_height_range_c, reject.
     ramped_height_range_c: 0.2                      # if z > max(d - ramped_height_range_b, 0) * ramped_height_range_a + ramped_height_range_c, reject.

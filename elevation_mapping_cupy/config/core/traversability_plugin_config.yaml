@@ -1,0 +1,221 @@
+# Geometric traversability-estimation pipeline (surface normals -> slope/step/roughness ->
+# fusion -> occupancy -> ESDF), ported from ETH Zurich's traversability_estimation and
+# grid_map_filters/NormalVectorsFilter. Loaded in ADDITION to plugin_config.yaml (see
+# `extra_plugin_config_file` param / elevation_mapping.py) so this pipeline is independently
+# toggleable from the digging-map cleanup chain without touching that file.
+#
+# Parameter provenance (see the implementation-plan writeup for full derivation):
+#   Map resolution: 0.10 m.
+#   Rover: 0.62 m x 0.48 m conservative footprint, wheel radius 0.105 m, wheel width 0.08 m,
+#   circumscribed radius 0.392 m. Ground clearance, max climbable step, max safe slope, and
+#   elevation noise have NOT been physically measured yet -- the values below are the
+#   explicitly-provided conservative placeholders (critical_step=0.06m, critical_slope=0.52rad
+#   /30deg, roughness_critical=0.04m, elevation noise ~0.01-0.02m), not upstream's own
+#   legged-robot/fine-grid defaults, which would be invalid at this resolution (see the
+#   estimation_radius note below). Re-tune once ground clearance / max step / max slope are
+#   physically measured.
+#
+# NOTE on the "traversability" name collision: elevation_mapping.py already hardcodes
+# "traversability" (core layer index 3) to the pre-existing torch/chainer edge-detector filter
+# (elevation_mapping_cupy/traversability_filter.py) via an explicit dispatch branch that runs
+# before the plugin-layer lookup. Naming the fused output here "traversability" would make it
+# silently unreachable. The internal layer name is `geom_traversability`; publish it under a
+# topic layer labeled "traversability" at the publisher level if you want that external name.
+
+surface_normal_x:
+  type: surface_normals
+  enable: True
+  fill_nan: False
+  is_height_layer: False
+  layer_name: "surface_normal_x"
+  extra_params:
+    input_layer_name: "inpaint"
+    # 0.15m ~ a 3x3-cell disk at this 0.10m resolution (radii <=0.05m would only ever see the
+    # center cell -- upstream's own 0.05m default is below this map's minimum usable radius of
+    # 0.5*resolution=0.05m and was rejected for that reason). Chosen to roughly match the
+    # rover's wheel scale (0.08m wheel width, 0.21m wheel diameter) without averaging away real
+    # small terrain features under a wheel.
+    estimation_radius: 0.15
+    minimum_valid_cells: 6
+    component: "x"
+surface_normal_y:
+  type: surface_normals
+  enable: True
+  fill_nan: False
+  is_height_layer: False
+  layer_name: "surface_normal_y"
+  extra_params:
+    input_layer_name: "inpaint"
+    estimation_radius: 0.15
+    minimum_valid_cells: 6
+    component: "y"
+surface_normal_z:
+  type: surface_normals
+  enable: True
+  fill_nan: False
+  is_height_layer: False
+  layer_name: "surface_normal_z"
+  extra_params:
+    input_layer_name: "inpaint"
+    estimation_radius: 0.15
+    minimum_valid_cells: 6
+    component: "z"
+
+traversability_slope:
+  type: slope_traversability
+  enable: True
+  fill_nan: False
+  is_height_layer: False
+  layer_name: "traversability_slope"
+  extra_params:
+    normal_z_layer_name: "surface_normal_z"
+    # 0.52 rad = 30 deg: explicit conservative placeholder pending a measured max safe slope.
+    critical_value: 0.52
+
+roughness:
+  type: roughness_traversability
+  enable: True
+  fill_nan: False
+  is_height_layer: False
+  layer_name: "roughness"
+  extra_params:
+    input_layer_name: "inpaint"
+    normal_x_layer_name: "surface_normal_x"
+    normal_y_layer_name: "surface_normal_y"
+    normal_z_layer_name: "surface_normal_z"
+    estimation_radius: 0.15
+    critical_value: 0.04
+    minimum_valid_cells: 5
+    output: "roughness"
+traversability_roughness:
+  type: roughness_traversability
+  enable: True
+  fill_nan: False
+  is_height_layer: False
+  layer_name: "traversability_roughness"
+  extra_params:
+    input_layer_name: "inpaint"
+    normal_x_layer_name: "surface_normal_x"
+    normal_y_layer_name: "surface_normal_y"
+    normal_z_layer_name: "surface_normal_z"
+    estimation_radius: 0.15
+    critical_value: 0.04
+    minimum_valid_cells: 5
+    output: "traversability"
+
+step_height:
+  type: step_traversability
+  enable: True
+  fill_nan: False
+  is_height_layer: False
+  layer_name: "step_height"
+  extra_params:
+    input_layer_name: "inpaint"
+    critical_value: 0.06
+    # first_window: local height-range probe, ~3x3 cells (unchanged). second_window: widened
+    # to ~0.4m (~50-cell disk) to cover the rover's full circumscribed radius (0.392m) rather
+    # than just its half-width (0.24m), so the "is this step spatially extensive" check
+    # reasons about the whole footprint, not half of it. Kept identical to traversability_step
+    # below -- these two entries must stay in sync, since step_height is only the
+    # visualization/debug layer and traversability_step is what actually drives
+    # geom_traversability/occupancy; a previous edit desynced them (critical_value 0.04/
+    # critical_cell_number 2 here vs 0.06/4 there) without changing what occupancy saw.
+    first_window_radius: 0.15
+    second_window_radius: 0.4
+    critical_cell_number: 4
+    output: "step_height"
+traversability_step:
+  type: step_traversability
+  enable: True
+  fill_nan: False
+  is_height_layer: False
+  layer_name: "traversability_step"
+  extra_params:
+    input_layer_name: "inpaint"
+    critical_value: 0.06
+    first_window_radius: 0.15
+    second_window_radius: 0.4
+    critical_cell_number: 4
+    output: "traversability"
+
+geom_traversability:
+  type: traversability_fusion
+  enable: True
+  fill_nan: False
+  is_height_layer: False
+  layer_name: "geom_traversability"
+  extra_params:
+    slope_layer_name: "traversability_slope"
+    step_layer_name: "traversability_step"
+    roughness_layer_name: "traversability_roughness"
+    method: "mean"
+    slope_weight: 1.0
+    step_weight: 1.0
+    roughness_weight: 1.0
+    allow_partial_average: False
+    output: "traversability"
+terrain_cost:
+  type: traversability_fusion
+  enable: True
+  fill_nan: False
+  is_height_layer: False
+  layer_name: "terrain_cost"
+  extra_params:
+    slope_layer_name: "traversability_slope"
+    step_layer_name: "traversability_step"
+    roughness_layer_name: "traversability_roughness"
+    method: "mean"
+    slope_weight: 1.0
+    step_weight: 1.0
+    roughness_weight: 1.0
+    allow_partial_average: False
+    output: "terrain_cost"
+
+occupancy:
+  type: traversability_occupancy
+  enable: True
+  fill_nan: False
+  is_height_layer: False
+  layer_name: "occupancy"
+  extra_params:
+    traversability_layer_name: "geom_traversability"
+    input_elevation_layer: "inpaint"
+    measured_validity_layer: "elevation"
+    variance_layer: "variance"
+    # UNVERIFIED placeholder: real observed variance on this map ranges from ~0.06 (best
+    # case, well-observed flat ground) up to the initial/never-observed default of 1000 (see
+    # core_param.yaml initial_variance) with a post-update cap of max_variance=100. 10.0 sits
+    # well above typical good-observation values and well below the "basically unobserved"
+    # range, but has not been validated against real recorded variance distributions --
+    # revisit once real-world variance histograms are available.
+    maximum_variance: 10.0
+    lethal_traversability_threshold: 0.30
+    inpaint_only_is_unknown: True
+
+esdf_metric:
+  type: traversability_esdf
+  enable: True
+  fill_nan: False
+  is_height_layer: False
+  layer_name: "esdf_metric"
+  extra_params:
+    occupancy_layer_name: "occupancy"
+    unknown_is_obstacle: True
+    truncation_distance: 1.5
+    output: "esdf_metric"
+esdf_encoded:
+  type: traversability_esdf
+  enable: True
+  fill_nan: False
+  is_height_layer: False
+  layer_name: "esdf_encoded"
+  extra_params:
+    occupancy_layer_name: "occupancy"
+    unknown_is_obstacle: True
+    # 1.5m: the task's own placeholder (2.25m) was tuned for a larger platform. This rover's
+    # circumscribed radius is 0.392m; 1.5m gives ~4x that as a clearance horizon, enough for
+    # local planning margin without wasting the encoding's resolution on distances far beyond
+    # anything this rover's footprint needs to reason about. Re-tune once Mighty's actual
+    # planning horizon for this platform is known.
+    truncation_distance: 1.5
+    output: "esdf_encoded"

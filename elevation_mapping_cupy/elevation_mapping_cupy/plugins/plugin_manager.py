@@ -137,8 +137,21 @@ class PluginManager(object):
         self._layer_generations = [-1] * len(self.plugins)
         self._empty_semantic_map = cp.zeros((0, self.cell_n, self.cell_n), dtype=cp.float32)
 
-    def load_plugin_settings(self, file_path: str):
-        cfg = YAML().load(open(file_path, "r"))
+    def load_plugin_settings(self, file_path):
+        """Load plugin definitions from a YAML file, or merge several.
+
+        `file_path` is normally a single path (the pre-existing, single-file behaviour,
+        unchanged). It may also be a list of paths, in which case each file's top-level
+        entries are merged in order -- a later file's key overrides an earlier file's key of
+        the same name. This lets an independent pipeline (e.g. traversability estimation)
+        live in its own YAML file while sharing the same plugin loading/caching machinery.
+        """
+        paths = [file_path] if isinstance(file_path, str) else list(file_path)
+        cfg = {}
+        for path in paths:
+            if not path:
+                continue
+            cfg.update(YAML().load(open(path, "r")))
         plugin_params = []
         extra_params = []
         for k, v in cfg.items():
@@ -218,15 +231,24 @@ class PluginManager(object):
                 raise RuntimeError(f"Cyclic plugin dependency detected while computing '{name}'")
             _active_stack.add(name)
             try:
+                # Single-dependency plugins (the pre-existing convention): one input_layer_name string.
                 input_layer_name = getattr(self.plugins[idx], "input_layer_name", None)
-                if input_layer_name in self.layer_names:
-                    dependency_idx = self.get_layer_index_with_name(input_layer_name)
+                dependencies = [input_layer_name] if input_layer_name else []
+                # Multi-dependency plugins (added for the traversability fusion/occupancy/ESDF chain,
+                # which each need several upstream layers computed fresh in the same cycle): an
+                # optional input_layer_names list. Backward compatible -- no existing plugin defines
+                # this attribute, so this branch is inert for all previously-existing plugins.
+                dependencies.extend(getattr(self.plugins[idx], "input_layer_names", []) or [])
+                for dependency_name in dependencies:
+                    if dependency_name not in self.layer_names:
+                        continue
+                    dependency_idx = self.get_layer_index_with_name(dependency_name)
                     if (
                         dependency_idx is not None
                         and self._layer_generations[dependency_idx] != self._generation
                     ):
                         self.update_with_name(
-                            input_layer_name,
+                            dependency_name,
                             elevation_map,
                             layer_names,
                             semantic_map=semantic_map,

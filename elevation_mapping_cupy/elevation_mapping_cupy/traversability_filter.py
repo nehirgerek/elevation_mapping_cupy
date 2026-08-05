@@ -26,7 +26,14 @@ def get_filter_torch(*args, **kwargs):
         def __call__(self, elevation_cupy):
             # Convert cupy tensor to pytorch.
             elevation_cupy = elevation_cupy.astype(cp.float32, copy=False)
-            elevation = torch.as_tensor(elevation_cupy, device=self.conv1.weight.device)
+            device = self.conv1.weight.device
+            if device.type == "cuda":
+                elevation = torch.as_tensor(elevation_cupy, device=device)
+            else:
+                # cupy arrays live in GPU memory; torch.as_tensor can only
+                # zero-copy them onto a CUDA device, so route through host
+                # memory when the filter has fallen back to CPU.
+                elevation = torch.from_numpy(cp.asnumpy(elevation_cupy))
 
             with torch.no_grad():
                 out1 = self.conv1(elevation.view(-1, 1, elevation.shape[0], elevation.shape[1]))
@@ -39,11 +46,30 @@ def get_filter_torch(*args, **kwargs):
                 # out = F.concat((out1, out2, out3), axis=1)
                 out = self.conv_out(out.abs())
                 out = torch.exp(-out)
-                out_cupy = cp.asarray(out)
+                out_cupy = cp.asarray(out) if device.type == "cuda" else cp.asarray(out.numpy())
 
             return out_cupy
 
-    traversability_filter = TraversabilityFilter(*args, **kwargs).cuda().eval()
+    def _build(device):
+        return TraversabilityFilter(*args, **kwargs).to(device).eval()
+
+    # Some GPUs (e.g. pre-Turing architectures such as sm_61/Pascal) have no
+    # compiled kernels in a given torch build; this only surfaces as a
+    # RuntimeError on the first real forward pass, not at construction or
+    # .cuda() time. Probe with a tiny dummy grid and fall back to CPU -- this
+    # filter is a handful of small 3x3 convolutions over the local elevation
+    # patch, cheap enough on CPU that the fallback costs no meaningful
+    # latency at the map's publish rate.
+    try:
+        traversability_filter = _build("cuda")
+        traversability_filter(cp.zeros((16, 16), dtype=cp.float32))
+    except RuntimeError as e:
+        print(
+            "[elevation_mapping_cupy] GPU rejected the traversability-filter "
+            f"CUDA kernels ({e}) -- falling back to CPU for this filter only."
+        )
+        traversability_filter = _build("cpu")
+
     return traversability_filter
 
 

@@ -204,6 +204,11 @@ class Parameter(Serializable):
     orientation_noise_thresh: float = 0.1  # if the orientation change is bigger than this value, the drift compensation happens.
 
     plugin_config_file: str = "config/plugin_config.yaml"  # configuration file for the plugin
+    # Optional second plugin config file, merged on top of plugin_config_file (later keys win
+    # on name collision). Empty string disables it. Used to keep the geometric traversability
+    # pipeline (surface normals/slope/roughness/step/fusion/occupancy/ESDF) in its own file,
+    # independently toggleable from the digging-map cleanup chain in plugin_config_file.
+    extra_plugin_config_file: str = ""
     weight_file: str = "config/weights.dat"  # weight file for traversability filter
 
     initial_variance: float = 10.0  # initial variance for each cell.
