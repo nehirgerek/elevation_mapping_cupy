@@ -1,9 +1,13 @@
 import cupy as cp
 
-from elevation_mapping_cupy.plugins.plugin_manager import PluginManager, PluginParams
+from elevation_mapping_cupy.plugins.plugin_manager import PluginBase, PluginManager, PluginParams
 
 
-class CountingPlugin:
+class CountingPlugin(PluginBase):
+    """Inherits PluginBase (like every real plugin) so it correctly picks up the no-op
+    defaults for on_generation_bump/on_map_shift/on_map_clear rather than crashing when
+    PluginManager calls them."""
+
     def __init__(self):
         self.calls = 0
 

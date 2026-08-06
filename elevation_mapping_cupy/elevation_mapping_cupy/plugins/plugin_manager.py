@@ -33,6 +33,15 @@ class PluginBase(ABC):
             The parameter of callback
         """
 
+    def on_generation_bump(self, generation: int) -> None:
+        """Optional hook, called on every reset_layers() (i.e. every new point-cloud fusion
+        cycle or map shift) with the PluginManager's own authoritative generation counter.
+        Lets a plugin that would otherwise redundantly repeat identical expensive work across
+        multiple sibling instances (e.g. surface_normals.py's x/y/z components all needing the
+        same covariance/eigendecomposition) share a class-level cache keyed on this counter,
+        without guessing via content fingerprinting. No-op by default."""
+        pass
+
     def on_map_clear(self) -> None:
         """Optional hook, paired with on_map_shift: called by PluginManager.notify_clear
         whenever the map is fully reset (ElevationMap.clear(), e.g. the clear_map service). A
@@ -196,6 +205,11 @@ class PluginManager(object):
         """Invalidate cached plugin layers so they will be recomputed on demand."""
         if hasattr(self, "_generation"):
             self._generation += 1
+            for plugin in self.plugins:
+                # getattr fallback: PluginBase provides a no-op default, but a duck-typed
+                # plugin that doesn't inherit PluginBase (e.g. an ad-hoc test double) may not
+                # have this hook at all -- don't let that crash the whole update cycle.
+                getattr(plugin, "on_generation_bump", lambda generation: None)(self._generation)
 
     def notify_shift(self, shift_value) -> None:
         """Forward a map-roll event to every plugin's on_map_shift hook. Called by
@@ -203,13 +217,13 @@ class PluginManager(object):
         (default no-op base implementation); a plugin holding its own persistent array (see
         PluginBase.on_map_shift) uses it to stay spatially aligned with the rolled map."""
         for plugin in self.plugins:
-            plugin.on_map_shift(shift_value)
+            getattr(plugin, "on_map_shift", lambda shift_value: None)(shift_value)
 
     def notify_clear(self) -> None:
         """Forward a full map-clear event to every plugin's on_map_clear hook. Called by
         ElevationMap.clear()."""
         for plugin in self.plugins:
-            plugin.on_map_clear()
+            getattr(plugin, "on_map_clear", lambda: None)()
 
     def get_plugin_names(self):
         names = []

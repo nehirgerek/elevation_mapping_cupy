@@ -108,7 +108,14 @@ def _compute_all(manager, elevation_map):
 # ---------------------------------------------------------------------------
 def test_flat_plane():
     cell_n = 60
-    manager = _make_manager(cell_n, resolution=0.1)
+    # Pin occupancy's hysteresis params explicitly rather than trust whatever is currently in
+    # the shared yaml -- these get actively re-tuned live (e.g. free_decrement), and this test
+    # is about the geometric pipeline's wiring/math, not about whatever value is currently
+    # live-tuned for real-robot behavior.
+    manager = _make_manager(
+        cell_n, resolution=0.1,
+        overrides={"occupancy": {"free_decrement": 1.0, "free_threshold": -2.0}},
+    )
     elevation_map = _base_map(cell_n)
     elevation_map[0] = 0.0  # flat ground
 
@@ -123,8 +130,8 @@ def test_flat_plane():
     assert float(cp.nanmin(out["geom_traversability"][interior, interior])) == pytest.approx(1.0, abs=1e-4)
     # occupancy (persistent_occupancy.py) is stateful, not a pure function of one cycle's
     # inputs -- a brand new cell starts UNKNOWN and needs enough reliable-free cycles to cross
-    # free_threshold before it's confirmed FREE (2 cycles at the configured
-    # free_decrement=1.0/free_threshold=-2.0 defaults). First cycle: still unknown.
+    # free_threshold before it's confirmed FREE (2 cycles at free_decrement=1.0/
+    # free_threshold=-2.0, pinned above). First cycle: still unknown.
     assert bool(cp.all(out["occupancy"][interior, interior] == -1.0))
     manager.reset_layers()
     out = _compute_all(manager, elevation_map)
