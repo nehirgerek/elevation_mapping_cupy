@@ -121,6 +121,13 @@ def test_flat_plane():
     assert float(cp.nanmin(out["traversability_roughness"][interior, interior])) == pytest.approx(1.0, abs=1e-4)
     assert float(cp.nanmin(out["traversability_step"][interior, interior])) == pytest.approx(1.0, abs=1e-4)
     assert float(cp.nanmin(out["geom_traversability"][interior, interior])) == pytest.approx(1.0, abs=1e-4)
+    # occupancy (persistent_occupancy.py) is stateful, not a pure function of one cycle's
+    # inputs -- a brand new cell starts UNKNOWN and needs enough reliable-free cycles to cross
+    # free_threshold before it's confirmed FREE (2 cycles at the configured
+    # free_decrement=1.0/free_threshold=-2.0 defaults). First cycle: still unknown.
+    assert bool(cp.all(out["occupancy"][interior, interior] == -1.0))
+    manager.reset_layers()
+    out = _compute_all(manager, elevation_map)
     assert bool(cp.all(out["occupancy"][interior, interior] == 0.0))
 
 
@@ -230,7 +237,13 @@ def test_nan_hole_uses_geometric_support_but_stays_unknown_in_occupancy():
     elevation_map[0][hole] = cp.nan
     elevation_map[2][hole] = 0.0  # not measured there
 
-    out = _compute_all(manager, elevation_map)
+    # occupancy is stateful (persistent_occupancy.py); run a few cycles so cells outside the
+    # hole have a chance to accumulate enough reliable-free evidence to leave UNKNOWN -- the
+    # hole itself must never accumulate any evidence at all, at any cycle count, since it's
+    # never "originally_observed".
+    for _ in range(3):
+        manager.reset_layers()
+        out = _compute_all(manager, elevation_map)
 
     # The hole itself has no elevation sample to use even as geometric support (this test does
     # not exercise a separate inpaint layer), so it must be unknown in occupancy.
@@ -257,7 +270,16 @@ def test_high_variance_cells_become_unknown():
     bad_patch = (slice(28, 32), slice(28, 32))
     elevation_map[1][bad_patch] = 50.0  # variance far above maximum_variance=1.0
 
+    # occupancy is stateful; the bad patch must never accumulate free evidence (it's never
+    # "reliably" observed) no matter how many cycles run, while the good patch needs 2 cycles
+    # to cross free_threshold at the default free_decrement=1.0/free_threshold=-2.0.
+    manager.reset_layers()
     out = _compute_all(manager, elevation_map)
+    assert bool(cp.all(out["occupancy"][bad_patch] == -1.0))
+
+    for _ in range(2):
+        manager.reset_layers()
+        out = _compute_all(manager, elevation_map)
     assert bool(cp.all(out["occupancy"][bad_patch] == -1.0))
     # Elsewhere, low variance + flat ground must still read free.
     assert bool(cp.all(out["occupancy"][10:20, 10:20] == 0.0))

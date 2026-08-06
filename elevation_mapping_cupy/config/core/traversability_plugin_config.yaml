@@ -172,25 +172,47 @@ terrain_cost:
     output: "terrain_cost"
 
 occupancy:
-  type: traversability_occupancy
+  # Stateful, persistent occupancy (see persistent_occupancy.py) -- replaces the previous
+  # stateless traversability_occupancy classification, which rebuilt -1/0/100 from scratch
+  # every cycle and so let a single missing/uncertain/high-variance reading instantly
+  # overwrite already-confirmed knowledge (the "free space turns to unknown" / "occupied
+  # cells don't persist through noise" behavior). traversability_occupancy.py itself is left
+  # in place, unused by this config, in case a stateless comparison is ever needed again.
+  type: persistent_occupancy
   enable: True
   fill_nan: False
   is_height_layer: False
   layer_name: "occupancy"
   extra_params:
     traversability_layer_name: "geom_traversability"
-    input_elevation_layer: "inpaint"
     measured_validity_layer: "elevation"
     variance_layer: "variance"
     # UNVERIFIED placeholder: real observed variance on this map ranges from ~0.06 (best
     # case, well-observed flat ground) up to the initial/never-observed default of 1000 (see
-    # core_param.yaml initial_variance) with a post-update cap of max_variance=100. 10.0 sits
-    # well above typical good-observation values and well below the "basically unobserved"
-    # range, but has not been validated against real recorded variance distributions --
-    # revisit once real-world variance histograms are available.
+    # core_param.yaml initial_variance) with a post-update cap of max_variance=100. Gates only
+    # the FREE side of evidence here (see persistent_occupancy.py) -- a confident hazard
+    # reading is never suppressed by high variance, matching this pipeline's existing
+    # principle (curbs/edges legitimately carry higher variance than flat ground).
     maximum_variance: 50.0
     lethal_traversability_threshold: 0.50
-    inpaint_only_is_unknown: True
+    # Hysteresis evidence-accumulation parameters (see persistent_occupancy.py's module
+    # docstring for the full model). No time-decay term exists -- a cell's confidence only
+    # moves when THIS cycle produced direct occupied or free evidence for it.
+    #   occupied_increment: how much confidence a single confidently-hazardous cycle adds.
+    #   free_decrement: how much confidence a single reliably-free cycle subtracts.
+    #   occupied_threshold / free_threshold: confidence must cross these to actually flip the
+    #     stored state (hysteresis -- an ambiguous cycle alone can never flip an already-
+    #     decided cell). At the defaults below, 1 hazard reading (>=2.0) is enough to newly
+    #     mark a cell occupied, but clearing an occupied cell (starting from confidence=6.0,
+    #     the max) needs (6.0 - (-2.0))/1.0 = 8 reliably-free cycles -- i.e. genuinely
+    #     "directly and reliably reobserved as free", not a single lucky frame.
+    #   minimum_confidence / maximum_confidence: hard clamp on the accumulator.
+    occupied_increment: 2.0
+    free_decrement: 1.0
+    occupied_threshold: 2.0
+    free_threshold: -2.0
+    minimum_confidence: -6.0
+    maximum_confidence: 6.0
 
 esdf_metric:
   type: traversability_esdf

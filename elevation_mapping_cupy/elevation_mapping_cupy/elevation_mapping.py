@@ -164,6 +164,7 @@ class ElevationMap:
             # Initial variance
             self.elevation_map[1] += self.initial_variance
             self.plugin_manager.reset_layers()
+            self.plugin_manager.notify_clear()
 
         self.mean_error = 0.0
         self.additive_mean_error = 0.0
@@ -261,6 +262,11 @@ class ElevationMap:
             self.pad_value(self.elevation_map, shift_value, idx=1, value=self.initial_variance)
             # Plugin layers are computed on-demand; invalidate cache when shifting.
             self.plugin_manager.reset_layers()
+            # Any plugin holding its own persistent state (e.g. persistent_occupancy's
+            # confidence accumulator) must roll+pad that state by the same shift to stay
+            # spatially aligned with the map -- reset_layers alone only invalidates the
+            # stateless on-demand cache, it doesn't touch a plugin's own arrays.
+            self.plugin_manager.notify_shift(shift_value)
 
     def shift_map_z(self, delta_z):
         """Shift the relevant layers along the vertical axis.

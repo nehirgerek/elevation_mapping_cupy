@@ -33,6 +33,24 @@ class PluginBase(ABC):
             The parameter of callback
         """
 
+    def on_map_clear(self) -> None:
+        """Optional hook, paired with on_map_shift: called by PluginManager.notify_clear
+        whenever the map is fully reset (ElevationMap.clear(), e.g. the clear_map service). A
+        stateful plugin should reset its own persistent arrays back to their initial/neutral
+        values here, matching the core elevation_map's own reset. No-op by default."""
+        pass
+
+    def on_map_shift(self, shift_value: "cp.ndarray") -> None:
+        """Optional hook for plugins that keep their own persistent state (e.g. an occupancy
+        confidence accumulator) across calls, rather than being purely a function of the
+        current elevation_map. Called by PluginManager.notify_shift whenever the underlying
+        map rolls (ElevationMap.shift_map_xy), with the same [row_shift, col_shift] cupy array
+        used to cp.roll the core elevation_map -- a stateful plugin must roll+pad its own
+        arrays identically to stay spatially aligned with the map it augments. No-op by
+        default; stateless plugins (the vast majority) never need to override this.
+        """
+        pass
+
     def __call__(
         self,
         elevation_map: cp.ndarray,
@@ -178,6 +196,20 @@ class PluginManager(object):
         """Invalidate cached plugin layers so they will be recomputed on demand."""
         if hasattr(self, "_generation"):
             self._generation += 1
+
+    def notify_shift(self, shift_value) -> None:
+        """Forward a map-roll event to every plugin's on_map_shift hook. Called by
+        ElevationMap.shift_map_xy alongside reset_layers -- stateless plugins ignore this
+        (default no-op base implementation); a plugin holding its own persistent array (see
+        PluginBase.on_map_shift) uses it to stay spatially aligned with the rolled map."""
+        for plugin in self.plugins:
+            plugin.on_map_shift(shift_value)
+
+    def notify_clear(self) -> None:
+        """Forward a full map-clear event to every plugin's on_map_clear hook. Called by
+        ElevationMap.clear()."""
+        for plugin in self.plugins:
+            plugin.on_map_clear()
 
     def get_plugin_names(self):
         names = []
