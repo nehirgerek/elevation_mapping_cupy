@@ -41,7 +41,7 @@
     service_namespace: '/elevation_mapping_cupy'
 
     max_ray_length: 20.0                            # maximum length for ray tracing.
-    cleanup_step: 0.1                               # subtitute this value from validity layer at visibiltiy cleanup.
+    cleanup_step: 0.2                               # subtitute this value from validity layer at visibiltiy cleanup.
     cleanup_cos_thresh: 0.1                         # subtitute this value from validity layer at visibiltiy cleanup.
 
     safe_thresh: 0.7                                # if traversability is smaller, it is counted as unsafe cell.
@@ -58,9 +58,9 @@
 
     #### Feature toggles ########
     enable_edge_sharpen: true
-    enable_visibility_cleanup: false
-    enable_drift_compensation: false
-    enable_overlap_clearance: false
+    enable_visibility_cleanup: true
+    enable_drift_compensation: true
+    enable_overlap_clearance: true
     enable_pointcloud_publishing: false
     enable_drift_corrected_TF_publishing: false
     #### Traversability filter ########

@@ -188,8 +188,8 @@ occupancy:
     # well above typical good-observation values and well below the "basically unobserved"
     # range, but has not been validated against real recorded variance distributions --
     # revisit once real-world variance histograms are available.
-    maximum_variance: 20.0
-    lethal_traversability_threshold: 0.30
+    maximum_variance: 50.0
+    lethal_traversability_threshold: 0.50
     inpaint_only_is_unknown: True
 
 esdf_metric:
