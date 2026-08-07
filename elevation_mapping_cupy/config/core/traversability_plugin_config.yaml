@@ -221,7 +221,7 @@ occupancy:
     occupied_threshold: 2.0
     free_threshold: -2.0
     minimum_confidence: -6.0
-    maximum_confidence: 6.0
+    maximum_confidence: 4.0
 
 esdf_metric:
   type: traversability_esdf

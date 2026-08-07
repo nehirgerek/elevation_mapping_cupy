@@ -67,3 +67,15 @@
                  'step_height', 'traversability_step', 'geom_traversability', 'terrain_cost']
         basic_layers: ['geom_traversability']
         fps: 5.0
+
+      # Slim ground-station feed. The full elevation_map_traversability above is
+      # ~10 MB/msg (10 float layers @ 400x400) -- subscribing it from hackbox RViz
+      # pushes ~20 MB/s through the rr08->hackbox RAVEN wifi router link, which
+      # saturates it and starves EVERY topic on that link (observed 2026-08-05:
+      # raw + traversability went silent at the ground station while the small
+      # inpainted topic kept flowing; all three were fine on the rover LAN).
+      # RViz colors by ONE layer at a time, so ship only the two fused outputs.
+      elevation_map_traversability_viz:
+        layers: ['geom_traversability', 'terrain_cost']
+        basic_layers: ['geom_traversability']
+        fps: 2.0
