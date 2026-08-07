@@ -203,7 +203,7 @@ occupancy:
     # reading is never suppressed by high variance, matching this pipeline's existing
     # principle (curbs/edges legitimately carry higher variance than flat ground).
     maximum_variance: 50.0
-    lethal_traversability_threshold: 0.35
+    lethal_traversability_threshold: 0.40
     # Hysteresis evidence-accumulation parameters (see persistent_occupancy.py's module
     # docstring for the full model). No time-decay term exists -- a cell's confidence only
     # moves when THIS cycle produced direct occupied or free evidence for it.
