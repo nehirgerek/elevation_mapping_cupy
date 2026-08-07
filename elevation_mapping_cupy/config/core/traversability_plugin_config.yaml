@@ -211,17 +211,28 @@ occupancy:
     #   free_decrement: how much confidence a single reliably-free cycle subtracts.
     #   occupied_threshold / free_threshold: confidence must cross these to actually flip the
     #     stored state (hysteresis -- an ambiguous cycle alone can never flip an already-
-    #     decided cell). At the defaults below, 1 hazard reading (>=2.0) is enough to newly
-    #     mark a cell occupied, but clearing an occupied cell (starting from confidence=6.0,
-    #     the max) needs (6.0 - (-2.0))/1.0 = 8 reliably-free cycles -- i.e. genuinely
-    #     "directly and reliably reobserved as free", not a single lucky frame.
+    #     decided cell).
     #   minimum_confidence / maximum_confidence: hard clamp on the accumulator.
-    occupied_increment: 2.0
-    free_decrement: 3.0
+    #
+    # Tuned for reactivity over stability (explicit tradeoff): minimum_confidence ==
+    # free_threshold and maximum_confidence == occupied_threshold, and both increment/
+    # decrement exceed the full confidence range. That means a SINGLE confidently-hazardous
+    # or reliably-free cycle immediately saturates the accumulator to the opposite boundary
+    # and flips the stored state right away, regardless of how much history the cell had
+    # accumulated in the other direction -- a newly-appeared obstacle or a newly-vacated cell
+    # shows up on the very next cycle instead of taking 3-4 cycles to overcome prior evidence.
+    # Missing/uncertain/high-variance cycles still leave confidence (and state) untouched, so
+    # this doesn't reintroduce the original stateless-flicker bug -- it only removes the
+    # extra corroboration requirement for cycles that DO produce confident evidence. If this
+    # proves too twitchy on noisy single-frame readings in practice, widen the gap between
+    # minimum_confidence/maximum_confidence and the thresholds (and/or lower the increment/
+    # decrement back below the full range) to require 2+ corroborating cycles again.
+    occupied_increment: 4.0
+    free_decrement: 4.0
     occupied_threshold: 2.0
     free_threshold: -2.0
-    minimum_confidence: -6.0
-    maximum_confidence: 6.0
+    minimum_confidence: -2.0
+    maximum_confidence: 2.0
 
 esdf_metric:
   type: traversability_esdf

@@ -51,6 +51,7 @@ def launch_setup(context, *args, **kwargs):
     deskewed_cloud_topic = LaunchConfiguration('deskewed_cloud_topic').perform(context)
     map_frame_id = LaunchConfiguration('map_frame_id').perform(context)
     base_frame_id = LaunchConfiguration('base_frame_id').perform(context)
+    sensor_frame_id = LaunchConfiguration('sensor_frame_id').perform(context)
     use_sim_time = LaunchConfiguration('use_sim_time').perform(context)
     launch_rviz = LaunchConfiguration('launch_rviz')
     rviz_config = LaunchConfiguration('rviz_config').perform(context)
@@ -82,6 +83,11 @@ def launch_setup(context, *args, **kwargs):
     params['map_frame'] = map_frame_id
     params['base_frame'] = base_frame_id
     params['corrected_map_frame'] = map_frame_id
+    # Frame treated as the sensor origin for the noise model / validity gate / visibility
+    # ray-casting when the deskewed cloud arrives already in the map frame -- see
+    # elevation_mapping_node.py pointcloud_callback. Defaults to the lidar frame (DLIO's
+    # frames/lidar); the node falls back to base_frame if this is empty/unavailable.
+    params['sensor_frame'] = sensor_frame_id
     params['use_sim_time'] = use_sim_time.lower() in ('true', '1')
 
     elevation_mapping_node = Node(
@@ -124,6 +130,8 @@ def generate_launch_description() -> LaunchDescription:
         ["'/' + '", quad, "' + '/dlio/odom_node/pointcloud/deskewed' if '", quad, "' else 'dlio/odom_node/pointcloud/deskewed'"])
     default_map_frame_id = PythonExpression(["'", quad, "/odom' if '", quad, "' else 'odom'"])
     default_base_frame_id = PythonExpression(["'", quad, "/base_link' if '", quad, "' else 'base_link'"])
+    # DLIO's frames/lidar (see its cfg/params.yaml), namespaced the same way as odom/base_link.
+    default_sensor_frame_id = PythonExpression(["'", quad, "/lidar' if '", quad, "' else 'lidar'"])
 
     deskewed_topic_arg = DeclareLaunchArgument(
         'deskewed_cloud_topic', default_value=default_deskewed_topic,
@@ -136,6 +144,12 @@ def generate_launch_description() -> LaunchDescription:
     base_frame_arg = DeclareLaunchArgument(
         'base_frame_id', default_value=default_base_frame_id,
         description="Must match DLIO's this->baselink_frame exactly.",
+    )
+    sensor_frame_arg = DeclareLaunchArgument(
+        'sensor_frame_id', default_value=default_sensor_frame_id,
+        description="Lidar frame used as the sensor origin for the noise model / height gate "
+                    "/ visibility ray-casting (DLIO's frames/lidar). Node falls back to "
+                    "base_frame if empty or its TF is unavailable.",
     )
     use_sim_time_arg = DeclareLaunchArgument(
         'use_sim_time', default_value='false',
@@ -153,6 +167,7 @@ def generate_launch_description() -> LaunchDescription:
         deskewed_topic_arg,
         map_frame_arg,
         base_frame_arg,
+        sensor_frame_arg,
         use_sim_time_arg,
         launch_rviz_arg,
         rviz_config_arg,

@@ -107,7 +107,13 @@ class ElevationMap:
         self.map_length = param.map_length
         self.cell_n = param.cell_n
 
-        self.map_lock = threading.Lock()
+        # RLock (not Lock): move/move_to wrap their whole body in this lock and then call
+        # shift_map_xy/shift_map_z, which independently lock too -- a plain Lock would
+        # deadlock on that same-thread reacquisition (export_layers/publish_map's per-layer
+        # loops nest the same way). elevation_mapping_node.py currently runs everything on a
+        # single thread, so this lock isn't load-bearing for cross-thread safety today, but
+        # keeps the nesting above from deadlocking and costs nothing extra on a single thread.
+        self.map_lock = threading.RLock()
         self.elevation_map = xp.zeros((7, self.cell_n, self.cell_n), dtype=self.data_type)
         self.layer_names = [
             "elevation",
@@ -176,7 +182,8 @@ class ElevationMap:
             position (numpy.ndarray):
 
         """
-        position[0][:] = xp.asnumpy(self.center)
+        with self.map_lock:
+            position[0][:] = xp.asnumpy(self.center)
 
     def move(self, delta_position):
         """Shift the map along all three axes according to the input.
@@ -184,14 +191,15 @@ class ElevationMap:
         Args:
             delta_position (numpy.ndarray):
         """
-        # Shift map using delta position.
-        delta_position = xp.asarray(delta_position)
-        delta_pixel = xp.round(delta_position[:2] / self.resolution)
-        delta_position_xy = delta_pixel * self.resolution
-        self.center[:2] += xp.asarray(delta_position_xy)
-        self.center[2] += xp.asarray(delta_position[2])
-        self.shift_map_xy(delta_pixel)
-        self.shift_map_z(-delta_position[2])
+        with self.map_lock:
+            # Shift map using delta position.
+            delta_position = xp.asarray(delta_position)
+            delta_pixel = xp.round(delta_position[:2] / self.resolution)
+            delta_position_xy = delta_pixel * self.resolution
+            self.center[:2] += xp.asarray(delta_position_xy)
+            self.center[2] += xp.asarray(delta_position[2])
+            self.shift_map_xy(delta_pixel)
+            self.shift_map_z(-delta_position[2])
 
     def move_to(self, position, R):
         """Shift the map to an absolute position and update the rotation of the robot.
@@ -200,16 +208,17 @@ class ElevationMap:
             position (numpy.ndarray):
             R (cupy._core.core.ndarray):
         """
-        # Shift map to the center of robot.
-        self.base_rotation = xp.asarray(R, dtype=self.data_type)
-        position = xp.asarray(position)
-        delta = position - self.center
-        delta_pixel = xp.around(delta[:2] / self.resolution)
-        delta_xy = delta_pixel * self.resolution
-        self.center[:2] += delta_xy
-        self.center[2] += delta[2]
-        self.shift_map_xy(-delta_pixel)
-        self.shift_map_z(-delta[2])
+        with self.map_lock:
+            # Shift map to the center of robot.
+            self.base_rotation = xp.asarray(R, dtype=self.data_type)
+            position = xp.asarray(position)
+            delta = position - self.center
+            delta_pixel = xp.around(delta[:2] / self.resolution)
+            delta_xy = delta_pixel * self.resolution
+            self.center[:2] += delta_xy
+            self.center[2] += delta[2]
+            self.shift_map_xy(-delta_pixel)
+            self.shift_map_z(-delta[2])
 
     def pad_value(self, x, shift_value, idx=None, value=0.0):
         """Create a padding of the map along x,y-axis according to amount that has shifted.
@@ -473,11 +482,13 @@ class ElevationMap:
 
     def update_variance(self):
         """Adds the time variacne to the valid cells."""
-        self.elevation_map[1] += self.param.time_variance * self.elevation_map[2]
+        with self.map_lock:
+            self.elevation_map[1] += self.param.time_variance * self.elevation_map[2]
 
     def update_time(self):
         """adds the time interval to the time layer."""
-        self.elevation_map[4] += self.param.time_interval
+        with self.map_lock:
+            self.elevation_map[4] += self.param.time_interval
 
     def update_upper_bound_with_valid_elevation(self):
         """Filters all invalid cell's upper_bound and is_upper_bound layers."""
@@ -1029,11 +1040,16 @@ class ElevationMap:
     def export_layers(self, layer_names: List[str]) -> Dict[str, np.ndarray]:
         exported: Dict[str, np.ndarray] = {}
         buffer = np.zeros((self.cell_n - 2, self.cell_n - 2), dtype=np.float32)
-        for name in layer_names:
-            if not self.exists_layer(name):
-                continue
-            self.get_map_with_name_ref(name, buffer)
-            exported[name] = buffer.copy()
+        # One outer lock acquisition (safe to nest with get_map_with_name_ref's own
+        # acquisition since map_lock is an RLock) so a concurrent pointcloud fusion can't
+        # land between two layers' fetches and leave the exported set spanning two
+        # generations.
+        with self.map_lock:
+            for name in layer_names:
+                if not self.exists_layer(name):
+                    continue
+                self.get_map_with_name_ref(name, buffer)
+                exported[name] = buffer.copy()
         return exported
 
     def apply_masked_replace(

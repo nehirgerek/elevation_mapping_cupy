@@ -142,6 +142,16 @@ class ElevationMappingNode(Node):
         self.param.update()
         self._pointcloud_process_counter = 0
         self._image_process_counter = 0
+        # TEMPORARY diagnostic instrumentation -- measuring live where real time actually goes
+        # (fusion vs. occupancy-chain vs. callback-to-callback gap) to find the ~1.6-1.8Hz vs
+        # 5Hz-configured bottleneck reported earlier. Remove once root-caused.
+        import time as _time
+        self._diag_time = _time
+        self._diag_pc_fusion_times = []
+        self._diag_pc_last_arrival = None
+        self._diag_pc_gaps = []
+        self._diag_occ_times = []
+        self._diag_log_every = 20
         self._map = ElevationMap(self.param)
         self._map_data = np.zeros(
             (self._map.cell_n - 2, self._map.cell_n - 2), dtype=np.float32
@@ -165,6 +175,17 @@ class ElevationMappingNode(Node):
         self.map_frame = self.get_parameter('map_frame').get_parameter_value().string_value
         self.base_frame = self.get_parameter('base_frame').get_parameter_value().string_value
         self.corrected_map_frame = self.get_parameter('corrected_map_frame').get_parameter_value().string_value
+        # Frame whose position is treated as the SENSOR origin when the incoming cloud is
+        # already expressed in the map frame (e.g. DLIO's deskewed-in-odom cloud). This drives
+        # the per-point noise model, the is_valid distance/height gate, and the visibility
+        # ray-cast origin -- see pointcloud_callback. Empty (default) -> fall back to
+        # base_frame. Set to the actual lidar frame (e.g. '<ns>/lidar') for the most correct
+        # range-from-sensor and height-above-sensor behaviour (the height gate is tight:
+        # max_height_range=0.5m, so the lidar's mount height above base_link matters). Does
+        # NOT affect where points land -- positions are invariant to this choice.
+        if not self.has_parameter('sensor_frame'):
+            self.declare_parameter('sensor_frame', '')
+        self.sensor_frame = self.get_parameter('sensor_frame').get_parameter_value().string_value
         self.initialize_method = self.get_parameter('initialize_method').get_parameter_value().string_value
         self.position_lowpass_alpha = self.get_parameter('position_lowpass_alpha').get_parameter_value().double_value
         self.orientation_lowpass_alpha = self.get_parameter('orientation_lowpass_alpha').get_parameter_value().double_value
@@ -521,7 +542,20 @@ class ElevationMappingNode(Node):
         if publisher is None or publisher.get_subscription_count() == 0:
             return
         try:
+            # TEMPORARY diagnostic instrumentation -- see initialize_elevation_mapping.
+            _diag_start = self._diag_time.perf_counter()
             self._map.get_map_with_name_ref(layer_name, self._map_data)
+            self._diag_occ_times.append((layer_name, self._diag_time.perf_counter() - _diag_start))
+            if len(self._diag_occ_times) >= self._diag_log_every:
+                by_layer = {}
+                for name, dt in self._diag_occ_times:
+                    by_layer.setdefault(name, []).append(dt)
+                summary = " | ".join(
+                    f"{name}: n={len(v)} mean_ms={np.mean(v)*1000:.1f} max_ms={np.max(v)*1000:.1f}"
+                    for name, v in by_layer.items()
+                )
+                self.get_logger().info(f"[DIAG occ_grid] {summary}")
+                self._diag_occ_times.clear()
         except KeyError:
             # The source plugin layer doesn't exist (e.g. extra_plugin_config_file wasn't
             # set, so the traversability pipeline was never loaded). Nothing to publish yet.
@@ -647,12 +681,16 @@ class ElevationMappingNode(Node):
         gm.layers = []
         gm.basic_layers = self.my_publishers[key]["basic_layers"]
 
-        for layer in self.my_publishers[key].get("layers", []):
-            gm.layers.append(layer)
-            self._map.get_map_with_name_ref(layer, self._map_data)
-            # After fixing CUDA kernels and removing flips in elevation_mapping.py, no flip needed here
-            map_data_for_gridmap = self._map_data
-            gm.data.append(self._numpy_to_multiarray(map_data_for_gridmap, layout="gridmap_column"))
+        # One lock acquisition across every layer (map_lock is an RLock, so nesting with
+        # get_map_with_name_ref's own acquisition is safe) so a message never mixes layers
+        # from two different generations.
+        with self._map.map_lock:
+            for layer in self.my_publishers[key].get("layers", []):
+                gm.layers.append(layer)
+                self._map.get_map_with_name_ref(layer, self._map_data)
+                # After fixing CUDA kernels and removing flips in elevation_mapping.py, no flip needed here
+                map_data_for_gridmap = self._map_data
+                gm.data.append(self._numpy_to_multiarray(map_data_for_gridmap, layout="gridmap_column"))
 
         gm.outer_start_index = 0
         gm.inner_start_index = 0
@@ -1128,7 +1166,42 @@ class ElevationMappingNode(Node):
             raise ValueError("PointCloud2 header.frame_id is empty.")
 
         if frame_sensor_id == self.map_frame:
-            t_np = np.zeros(3, dtype=np.float32)
+            # The cloud is already expressed in the map frame (e.g. DLIO's deskewed cloud in
+            # odom), so no rotation/translation is needed to POSITION the points. But the
+            # fusion kernels' per-point noise model (point_noise), validity gate (is_valid)
+            # and visibility ray-casting all need the SENSOR's position, and they read it from
+            # `t`. Passing t=0 here (the old shortcut) made them treat the map/odom origin as
+            # the sensor, so measurement variance scaled as sensor_noise_factor * |p_odom|^2
+            # (distance from the odom origin) instead of true sensor range. Beyond
+            # ~sqrt(max_variance / sensor_noise_factor) that pushed every freshly-observed
+            # cell past max_variance, resetting it to unknown -- the map stopped populating
+            # once the robot drove far from where it started.
+            #
+            # Fix (no kernel changes): look up the sensor position in the map frame and make
+            # the point coords sensor-relative. With R=I and t=sensor_pos, transform_p
+            # reconstructs the original absolute position (rx + t = (p - sensor_pos) +
+            # sensor_pos = p), so cell placement is unchanged, while point_noise now sees the
+            # true range from the sensor and is_valid / ray-casting get the correct sensor
+            # origin. The sensor frame is configurable (sensor_frame param) -- set it to the
+            # lidar frame for exact range/height-above-sensor; it defaults to base_frame,
+            # which is off only by the lidar mounting offset. The odom-frame cloud's own
+            # header can't supply this (it's stamped in the map frame, not the sensor frame).
+            sensor_frame = self.sensor_frame if self.sensor_frame else self.base_frame
+            sensor_transform = self.safe_lookup_transform(
+                self.map_frame,
+                sensor_frame,
+                msg.header.stamp,
+            )
+            if sensor_transform is None:
+                # Sensor pose not available yet -- skip this cloud rather than fusing with a
+                # wrong (origin) sensor position.
+                return
+            st = sensor_transform.transform.translation
+            # float64 for the shift to avoid large-magnitude cancellation far from the origin,
+            # then back to float32 (the sensor-relative coords are small, ~0-50m).
+            sensor_pos = np.array([st.x, st.y, st.z], dtype=np.float64)
+            pts[:, :3] = (pts[:, :3].astype(np.float64) - sensor_pos).astype(np.float32)
+            t_np = sensor_pos.astype(np.float32)
             R = np.eye(3, dtype=np.float32)
         else:
             transform_sensor_to_map = self.safe_lookup_transform(
@@ -1144,8 +1217,27 @@ class ElevationMappingNode(Node):
             t_np = np.array([t.x, t.y, t.z], dtype=np.float32)
             R = quaternion_matrix([q.x, q.y, q.z, q.w])[:3, :3].astype(np.float32)
 
+        # TEMPORARY diagnostic instrumentation -- see initialize_elevation_mapping.
+        now = self._diag_time.perf_counter()
+        if self._diag_pc_last_arrival is not None:
+            self._diag_pc_gaps.append(now - self._diag_pc_last_arrival)
+        self._diag_pc_last_arrival = now
+
+        fusion_start = self._diag_time.perf_counter()
         self._map.input_pointcloud(pts, channels, R, t_np, 0, 0)
+        self._diag_pc_fusion_times.append(self._diag_time.perf_counter() - fusion_start)
         self._pointcloud_process_counter += 1
+
+        if len(self._diag_pc_fusion_times) >= self._diag_log_every:
+            fusion_arr = np.array(self._diag_pc_fusion_times)
+            gap_arr = np.array(self._diag_pc_gaps) if self._diag_pc_gaps else np.array([np.nan])
+            self.get_logger().info(
+                f"[DIAG pointcloud] n={len(fusion_arr)} fusion_ms mean={fusion_arr.mean()*1000:.1f} "
+                f"max={fusion_arr.max()*1000:.1f} | inter-arrival_ms mean={gap_arr.mean()*1000:.1f} "
+                f"max={gap_arr.max()*1000:.1f} (implied arrival Hz={1.0/gap_arr.mean():.2f})"
+            )
+            self._diag_pc_fusion_times.clear()
+            self._diag_pc_gaps.clear()
 
     def pose_update(self) -> None:
         if self._last_t is None:
@@ -1181,6 +1273,13 @@ class ElevationMappingNode(Node):
 def main(args=None) -> None:
     rclpy.init(args=args)
     node = ElevationMappingNode()
+    # SingleThreadedExecutor: a MultiThreadedExecutor + split callback groups was tried
+    # here to decouple sensor ingestion from publish-timer callbacks, but made live latency
+    # dramatically worse in practice (likely lock-contention/thread-scheduling overhead on
+    # ElevationMap.map_lock outweighing any dispatch-level benefit) -- reverted. The
+    # vectorization/caching work in surface_normals.py/step_traversability.py/
+    # traversability_esdf.py already brought the full plugin chain down to ~1-50ms per
+    # cycle, which a single thread comfortably keeps up with at the configured rates.
     executor = rclpy.executors.SingleThreadedExecutor()
     executor.add_node(node)
     try:
