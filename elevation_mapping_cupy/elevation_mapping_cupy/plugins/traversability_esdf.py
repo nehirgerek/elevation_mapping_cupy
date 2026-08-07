@@ -20,6 +20,13 @@
 #                      *encoded distance field*, not an occupancy probability grid -- values
 #                      1-99 here mean "this many percent of the way to full clearance", never
 #                      "this cell is N% likely occupied".
+#
+# PERFORMANCE: esdf_metric and esdf_encoded are two separate plugin instances that both
+# depend on the same occupancy layer and, with unknown_is_obstacle held equal between them
+# (the only two production configs in this repo), compute an IDENTICAL distance_transform_edt
+# -- differing only in the final passthrough-vs-clamp-and-encode step. Sharing that transform
+# across instances the same way surface_normals.py shares eigh across x/y/z, keyed by
+# (occupancy_layer_name, unknown_is_obstacle, cell_n) + generation.
 import cupy as cp
 from cupyx.scipy.ndimage import distance_transform_edt
 from typing import List, Optional
@@ -28,6 +35,8 @@ from .plugin_manager import PluginBase
 
 
 class TraversabilityEsdf(PluginBase):
+    _shared_cache: dict = {}
+
     def __init__(
         self,
         cell_n: int = 200,
@@ -39,6 +48,8 @@ class TraversabilityEsdf(PluginBase):
         **kwargs,
     ):
         super().__init__()
+        TraversabilityEsdf._shared_cache.clear()
+        self._current_generation = -1
         self.cell_n = int(cell_n)
         self.resolution = float(resolution)
         self.occupancy_layer_name = occupancy_layer_name
@@ -50,6 +61,9 @@ class TraversabilityEsdf(PluginBase):
         if output not in ("esdf_encoded", "esdf_metric"):
             raise ValueError(f"traversability_esdf: output must be 'esdf_encoded' or 'esdf_metric', got {output!r}")
         self.output = output
+
+    def on_generation_bump(self, generation) -> None:
+        self._current_generation = generation
 
     def _lookup(self, elevation_map, layer_names, plugin_layers, plugin_layer_names) -> Optional[cp.ndarray]:
         name = self.occupancy_layer_name
@@ -67,32 +81,40 @@ class TraversabilityEsdf(PluginBase):
         plugin_layer_names: List[str],
         *args,
     ) -> cp.ndarray:
-        occupancy = self._lookup(elevation_map, layer_names, plugin_layers, plugin_layer_names)
-        if occupancy is None:
-            fallback = 0.0 if self.output == "esdf_metric" else 100.0
-            return cp.full((self.cell_n, self.cell_n), fallback, dtype=cp.float32)
+        cache_key = (self.occupancy_layer_name, self.unknown_is_obstacle, self.cell_n)
+        cached = TraversabilityEsdf._shared_cache.get(cache_key)
+        if cached is not None and cached[0] == self._current_generation:
+            distance_m = cached[1]
+        else:
+            occupancy = self._lookup(elevation_map, layer_names, plugin_layers, plugin_layer_names)
+            if occupancy is None:
+                fallback = 0.0 if self.output == "esdf_metric" else 100.0
+                return cp.full((self.cell_n, self.cell_n), fallback, dtype=cp.float32)
 
-        seed = occupancy >= 99.5  # occupancy == 100 (hard obstacle)
-        if self.unknown_is_obstacle:
-            seed = seed | (occupancy <= -0.5)  # occupancy == -1 (unknown)
+            seed = occupancy >= 99.5  # occupancy == 100 (hard obstacle)
+            if self.unknown_is_obstacle:
+                seed = seed | (occupancy <= -0.5)  # occupancy == -1 (unknown)
 
-        if not bool(cp.any(seed)):
-            # No obstacle/unknown seeds anywhere on the map: nothing to measure distance to.
-            # Treat every cell as at-or-beyond the truncation distance (maximally clear),
-            # rather than dividing by zero or leaving an undefined distance transform.
-            if self.output == "esdf_metric":
-                return cp.full((self.cell_n, self.cell_n), cp.inf, dtype=cp.float32)
-            return cp.zeros((self.cell_n, self.cell_n), dtype=cp.float32)
+            if not bool(cp.any(seed)):
+                # No obstacle/unknown seeds anywhere on the map: nothing to measure distance
+                # to. Treat every cell as at-or-beyond the truncation distance (maximally
+                # clear), rather than dividing by zero or leaving an undefined distance
+                # transform. Not cached -- this all-clear case is cheap and rare enough that
+                # sharing it isn't worth a separate cache-value convention.
+                if self.output == "esdf_metric":
+                    return cp.full((self.cell_n, self.cell_n), cp.inf, dtype=cp.float32)
+                return cp.zeros((self.cell_n, self.cell_n), dtype=cp.float32)
 
-        # distance_transform_edt(input) computes, for every True cell in `input`, the
-        # (cell-unit) distance to the nearest False cell. We want, for every cell, the
-        # distance to the nearest seed -- i.e. invert the seed mask so seeds are False
-        # (distance 0 there) and everything else is True.
-        distance_cells = distance_transform_edt(~seed)
-        distance_m = distance_cells.astype(cp.float32) * self.resolution
-        # Seeds themselves are exactly zero (edt gives 0 at False cells by definition, but be
-        # explicit and robust to any implementation edge case).
-        distance_m = cp.where(seed, 0.0, distance_m)
+            # distance_transform_edt(input) computes, for every True cell in `input`, the
+            # (cell-unit) distance to the nearest False cell. We want, for every cell, the
+            # distance to the nearest seed -- i.e. invert the seed mask so seeds are False
+            # (distance 0 there) and everything else is True.
+            distance_cells = distance_transform_edt(~seed)
+            distance_m = distance_cells.astype(cp.float32) * self.resolution
+            # Seeds themselves are exactly zero (edt gives 0 at False cells by definition, but
+            # be explicit and robust to any implementation edge case).
+            distance_m = cp.where(seed, 0.0, distance_m)
+            TraversabilityEsdf._shared_cache[cache_key] = (self._current_generation, distance_m)
 
         if self.output == "esdf_metric":
             return distance_m

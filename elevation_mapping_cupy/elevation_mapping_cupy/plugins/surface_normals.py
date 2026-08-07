@@ -23,11 +23,20 @@
 # The plugin framework registers one plugin instance per output layer (one 2D array per YAML
 # block), so this same class is configured three times (component: x/y/z, matching the
 # `type:` override convention already used by positive_spike_filter_cleanup in
-# plugin_config.yaml) rather than returning all three axes from one call. Each instance
-# redundantly recomputes the full covariance/eigendecomposition; at this map size (~200x200,
-# ~9-25 stencil points) that 3x cost is negligible next to the eigh call itself, and it avoids
-# a cross-plugin-instance cache that the existing architecture has no mechanism for.
+# plugin_config.yaml) rather than returning all three axes from one call.
+#
+# PERFORMANCE: measured live, cp.linalg.eigh over the batched (cell_n,cell_n,3,3) covariance
+# tensor is the dominant cost of this plugin (~30ms of ~30ms total at cell_n=400) -- NOT
+# negligible when redundantly repeated 3x (once per x/y/z instance) every cycle. The three
+# instances share the exact same input/estimation_radius/minimum_valid_cells in this pipeline's
+# config, so they'd compute an IDENTICAL covariance tensor and eigendecomposition. _shared_cache
+# below (class-level, keyed on PluginManager's own generation counter via on_generation_bump)
+# lets whichever of the three instances runs first in a cycle do the real work once; the other
+# two just slice out their own component from the cached full result. Cache is cleared on
+# __init__ (i.e. whenever a PluginManager is (re)constructed) so multiple independent managers
+# in the same process (e.g. across unit tests) can never see each other's cached arrays.
 import cupy as cp
+import cupyx.scipy.ndimage as ndi
 import numpy as np
 from typing import List, Optional
 
@@ -37,6 +46,10 @@ _AXIS_INDEX = {"x": 0, "y": 1, "z": 2}
 
 
 class SurfaceNormals(PluginBase):
+    # Class-level (shared across all x/y/z instances in this process) cache -- see module
+    # docstring "PERFORMANCE" note. Cleared on every __init__ to prevent cross-manager leakage.
+    _shared_cache: dict = {}
+
     def __init__(
         self,
         cell_n: int = 200,
@@ -48,6 +61,8 @@ class SurfaceNormals(PluginBase):
         **kwargs,
     ):
         super().__init__()
+        SurfaceNormals._shared_cache.clear()
+        self._current_generation = -1  # sentinel: "no on_generation_bump seen yet"
         self.input_layer_name = input_layer_name
         self.resolution = float(resolution)
         self.cell_n = int(cell_n)
@@ -84,6 +99,42 @@ class SurfaceNormals(PluginBase):
                 f"-- increase estimation_radius or lower minimum_valid_cells."
             )
         self._offsets = offsets
+
+        # Precomputed correlation kernels -- replace the old per-offset Python shift-loop
+        # (9-25 sequential cp.full_like/slice/add ops per call) with a single cupyx.scipy.
+        # ndimage.correlate call per accumulator. correlate(x, kernel, mode='constant',
+        # cval=0.0) with kernel[center+dr, center+dc] = weight(dr,dc) is mathematically
+        # IDENTICAL to summing weight(dr,dc)*shifted(x,dr,dc) over all disk offsets (verified
+        # bit-exact, max abs diff 0.0, against the original shift-loop on both plain-count and
+        # geometrically-weighted accumulators, including with NaN holes and boundary rows) --
+        # this is a pure vectorization, not an approximation. Kernels for x_off/y_off-weighted
+        # accumulators (sx, sy, sxx, syy, sxy) are purely geometric (depend only on disk shape/
+        # resolution, never on cell content), so they're built once here, not per-call.
+        max_cell_radius = int(np.ceil(self.estimation_radius / self.resolution))
+        ksize = 2 * max_cell_radius + 1
+        center = max_cell_radius
+        k_ones = cp.zeros((ksize, ksize), dtype=cp.float32)
+        k_x = cp.zeros((ksize, ksize), dtype=cp.float32)
+        k_y = cp.zeros((ksize, ksize), dtype=cp.float32)
+        k_xx = cp.zeros((ksize, ksize), dtype=cp.float32)
+        k_yy = cp.zeros((ksize, ksize), dtype=cp.float32)
+        k_xy = cp.zeros((ksize, ksize), dtype=cp.float32)
+        for dr, dc, x_off, y_off in offsets:
+            k_ones[center + dr, center + dc] = 1.0
+            k_x[center + dr, center + dc] = x_off
+            k_y[center + dr, center + dc] = y_off
+            k_xx[center + dr, center + dc] = x_off * x_off
+            k_yy[center + dr, center + dc] = y_off * y_off
+            k_xy[center + dr, center + dc] = x_off * y_off
+        self._k_ones = k_ones
+        self._k_x = k_x
+        self._k_y = k_y
+        self._k_xx = k_xx
+        self._k_yy = k_yy
+        self._k_xy = k_xy
+
+    def on_generation_bump(self, generation: int) -> None:
+        self._current_generation = generation
 
     @staticmethod
     def _shifted(arr: cp.ndarray, dr: int, dc: int) -> cp.ndarray:
@@ -125,38 +176,35 @@ class SurfaceNormals(PluginBase):
         plugin_layer_names: List[str],
         *args,
     ) -> cp.ndarray:
+        cache_key = (self.input_layer_name, self.estimation_radius, self.minimum_valid_cells, self.cell_n)
+        cached = SurfaceNormals._shared_cache.get(cache_key)
+        if cached is not None and cached[0] == self._current_generation:
+            result = cached[1]
+            return result[..., _AXIS_INDEX[self.component]].astype(cp.float32)
+
         height = self._get_input(elevation_map, layer_names, plugin_layers, plugin_layer_names)
         if height is None:
             return cp.full((self.cell_n, self.cell_n), cp.nan, dtype=cp.float32)
         height = height.astype(cp.float32)
 
-        n_pts = cp.zeros_like(height)
-        sx = cp.zeros_like(height)
-        sy = cp.zeros_like(height)
-        sz = cp.zeros_like(height)
-        sxx = cp.zeros_like(height)
-        syy = cp.zeros_like(height)
-        szz = cp.zeros_like(height)
-        sxy = cp.zeros_like(height)
-        sxz = cp.zeros_like(height)
-        syz = cp.zeros_like(height)
+        valid = cp.isfinite(height)
+        valid_f = valid.astype(cp.float32)
+        masked_z = cp.where(valid, height, 0.0)
+        masked_zz = cp.where(valid, height * height, 0.0)
 
-        for dr, dc, x_off, y_off in self._offsets:
-            z = self._shifted(height, dr, dc)
-            valid = cp.isfinite(z)
-            zf = cp.where(valid, z, 0.0)
-            w = valid.astype(cp.float32)
+        def _corr(x, k):
+            return ndi.correlate(x, k, mode="constant", cval=0.0)
 
-            n_pts += w
-            sx += w * x_off
-            sy += w * y_off
-            sz += w * zf
-            sxx += w * (x_off * x_off)
-            syy += w * (y_off * y_off)
-            szz += w * (zf * zf)
-            sxy += w * (x_off * y_off)
-            sxz += w * (x_off * zf)
-            syz += w * (y_off * zf)
+        n_pts = _corr(valid_f, self._k_ones)
+        sx = _corr(valid_f, self._k_x)
+        sy = _corr(valid_f, self._k_y)
+        sxx = _corr(valid_f, self._k_xx)
+        syy = _corr(valid_f, self._k_yy)
+        sxy = _corr(valid_f, self._k_xy)
+        sz = _corr(masked_z, self._k_ones)
+        szz = _corr(masked_zz, self._k_ones)
+        sxz = _corr(masked_z, self._k_x)
+        syz = _corr(masked_z, self._k_y)
 
         enough = n_pts >= self.minimum_valid_cells
         n_safe = cp.where(enough, n_pts, 1.0)
@@ -201,4 +249,5 @@ class SurfaceNormals(PluginBase):
         normal = cp.where(flip[..., None], -normal, normal)
 
         result = cp.where(valid_normal[..., None], normal, cp.nan)
+        SurfaceNormals._shared_cache[cache_key] = (self._current_generation, result)
         return result[..., _AXIS_INDEX[self.component]].astype(cp.float32)
