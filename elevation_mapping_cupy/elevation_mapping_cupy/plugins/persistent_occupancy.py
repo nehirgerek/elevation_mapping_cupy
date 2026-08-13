@@ -19,9 +19,15 @@
 # Evidence model (per cell, per cycle):
 #   occupied_evidence = originally_observed AND confidently hazardous this cycle
 #     (geom_traversability < lethal_traversability_threshold, OR a configured
-#     neighbor_step_hazard confirms one -- deliberately NOT gated on variance, matching this
-#     pipeline's existing principle that a confident hazard reading should not be suppressed
-#     just because the same cell's variance is also elevated -- see traversability_occupancy.py)
+#     neighbor_step_hazard confirms one) AND variance <= hazard_maximum_variance
+#     This direction WAS ungated on variance, on the principle that a confident hazard
+#     reading should not be suppressed just because the cell's variance is also elevated
+#     (curbs/edges legitimately carry higher variance than flat ground). That principle
+#     holds in the near field but broke down at range: variance grows as
+#     sensor_noise_factor * range^2, so an ungated hazard path let sparse far-field returns
+#     stamp permanent phantom obstacles. hazard_maximum_variance restores the principle
+#     within a trust horizon and rejects hazard evidence outside it. Set <= 0 to disable
+#     the gate and get the original ungated behaviour back.
 #   free_evidence = originally_observed AND confidently non-hazardous AND variance <=
 #     maximum_variance (this direction IS variance-gated: the task this file implements is
 #     explicit that clearing a dynamic object's former position requires the ground being
@@ -73,6 +79,7 @@ class PersistentOccupancy(PluginBase):
         neighbor_step_hazard_layer_name: str = "",
         lethal_traversability_threshold: float = 0.30,
         maximum_variance: float = 20.0,
+        hazard_maximum_variance: float = -1.0,
         occupied_increment: float = 2.0,
         free_decrement: float = 1.0,
         occupied_threshold: float = 2.0,
@@ -93,6 +100,7 @@ class PersistentOccupancy(PluginBase):
 
         self.lethal_traversability_threshold = float(lethal_traversability_threshold)
         self.maximum_variance = float(maximum_variance)
+        self.hazard_maximum_variance = float(hazard_maximum_variance)
         self.occupied_increment = float(occupied_increment)
         self.free_decrement = float(free_decrement)
         self.occupied_threshold = float(occupied_threshold)
@@ -185,6 +193,25 @@ class PersistentOccupancy(PluginBase):
             )
             if hazard is not None:
                 confirmed_hazard = confirmed_hazard | (originally_observed & cp.isfinite(hazard) & (hazard > 0.5))
+
+        # Range gate on the OCCUPIED path. Cell variance grows as sensor_noise_factor *
+        # range^2 (core_param.yaml), so this is a distance cutoff in disguise:
+        # r = sqrt(hazard_maximum_variance / sensor_noise_factor). Beyond it the lidar's
+        # returns are too sparse for geom_traversability to be meaningful, and a spurious
+        # dip below lethal_traversability_threshold used to stamp a permanent phantom
+        # obstacle (this plugin has no time decay -- only opposing evidence clears a cell,
+        # and the opposing free evidence is itself variance-gated, so far-field phantoms
+        # were effectively unclearable).
+        #
+        # Gating here rather than slowing the hysteresis is deliberate: corroboration is a
+        # global brake that would cost near-field reactivity, where the data is good and
+        # fast response matters. With both directions range-gated, cells past the horizon
+        # simply produce NO evidence and stay UNKNOWN until the robot gets close enough --
+        # which is also what the frontier detector needs to keep finding them.
+        #
+        # <= 0 disables the gate (legacy ungated behaviour).
+        if self.hazard_maximum_variance > 0.0:
+            confirmed_hazard = confirmed_hazard & (variance <= self.hazard_maximum_variance)
 
         reliable_free = (
             originally_observed
