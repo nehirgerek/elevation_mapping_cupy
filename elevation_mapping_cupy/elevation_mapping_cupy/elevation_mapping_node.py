@@ -1100,6 +1100,67 @@ class ElevationMappingNode(Node):
         )
         self._image_process_counter += 1
 
+    def _apply_sensor_window(self, pts, sub_key, frame_sensor_id):
+        """Drop points outside a per-subscriber FoV / range window.
+
+        Every point gate in core_param.yaml (min_valid_distance, max_height_range,
+        max_ray_length) and every traversability threshold is GLOBAL -- shared by
+        all subscribers. That is fine while a single lidar feeds the map, but a
+        depth camera and a lidar do not fail in the same places, so one setting
+        cannot suit both. The keys read here are per-subscriber.
+
+        Measured on RR08 against the Livox floor plane in base_link (so the
+        result does not depend on DLIO): the D455 is excellent overall -- median
+        error +5 mm, p90 +8 mm, only 0.6% of points beyond critical_step -- but
+        the errors are sharply localised. Below 20 deg elevation 0.0-0.1% of
+        points are bad; above it ~2.9% are, where the rays graze the floor at
+        long range. Cutting at 20 deg removed 94% of the bad points for 18% of
+        the good ones. Edges (|azimuth| > 35 deg) and depth > 2 m degrade too,
+        and are available here, but were left unset as their cost/benefit was
+        worse -- re-measure before enabling.
+
+        Angles follow the ROS optical convention of the cloud's OWN frame
+        (z forward, x right, y down), so elevation is +ve toward the TOP of the
+        image. That is only meaningful while the cloud is still in its sensor
+        frame, so a cloud already in the map frame is passed through untouched.
+        """
+        cfg = self.param.subscriber_cfg[sub_key]
+        elev_max = cfg.get("fov_elev_max_deg")
+        elev_min = cfg.get("fov_elev_min_deg")
+        azim_abs = cfg.get("fov_azim_abs_max_deg")
+        range_max = cfg.get("max_range")
+        range_min = cfg.get("min_range")
+        if all(v is None for v in (elev_max, elev_min, azim_abs, range_max, range_min)):
+            return pts
+
+        if frame_sensor_id == self.map_frame:
+            self.get_logger().warn(
+                f"subscriber '{sub_key}' configures a FoV/range window, but its cloud "
+                f"arrives already in the map frame '{self.map_frame}' where those angles "
+                "are meaningless -- window ignored.",
+                throttle_duration_sec=10.0,
+            )
+            return pts
+
+        x, y, z = pts[:, 0], pts[:, 1], pts[:, 2]
+        fwd = np.maximum(z, 1e-6)
+        keep = z > 0.0
+        if elev_max is not None or elev_min is not None:
+            elev = np.degrees(np.arctan2(-y, fwd))
+            if elev_max is not None:
+                keep &= elev <= float(elev_max)
+            if elev_min is not None:
+                keep &= elev >= float(elev_min)
+        if azim_abs is not None:
+            keep &= np.abs(np.degrees(np.arctan2(x, fwd))) <= float(azim_abs)
+        if range_max is not None or range_min is not None:
+            rng = np.sqrt(x * x + y * y + z * z)
+            if range_max is not None:
+                keep &= rng <= float(range_max)
+            if range_min is not None:
+                keep &= rng >= float(range_min)
+        return pts[keep]
+
     def pointcloud_callback(self, msg: PointCloud2, sub_key: str) -> None:
         self._last_t = msg.header.stamp
         additional_channels = list(self.param.subscriber_cfg[sub_key].get("channels", []))
@@ -1164,6 +1225,12 @@ class ElevationMappingNode(Node):
         frame_sensor_id = msg.header.frame_id
         if not frame_sensor_id:
             raise ValueError("PointCloud2 header.frame_id is empty.")
+
+        # Per-subscriber FoV/range window, applied while the points are still in
+        # the sensor frame -- the only place their angles mean anything.
+        pts = self._apply_sensor_window(pts, sub_key, frame_sensor_id)
+        if pts.size == 0:
+            return
 
         if frame_sensor_id == self.map_frame:
             # The cloud is already expressed in the map frame (e.g. DLIO's deskewed cloud in

@@ -72,14 +72,19 @@ def launch_setup(context, *args, **kwargs):
     # file itself available to load.
     params['extra_plugin_config_file'] = traversability_param_path
 
-    # Overrides -- see dlio/base.yaml's header comment for why these three
-    # (topic/map_frame/base_frame) are placeholders in the file itself.
-    params['subscribers'] = {
-        'dlio_cloud': {
-            'topic_name': deskewed_cloud_topic,
-            'data_type': 'pointcloud',
-        }
-    }
+    # Overrides -- see dlio/base.yaml's header comment for why these
+    # (map_frame/base_frame + dlio_cloud's topic) are placeholders in the file.
+    #
+    # base.yaml is authoritative for the subscriber LIST; only dlio_cloud's topic
+    # name is overridden here, from the deskewed_cloud_topic launch arg (which
+    # already carries the quad prefix). Assigning params['subscribers'] wholesale
+    # -- as this did until the D455 was added -- silently DISCARDS every other
+    # subscriber declared in base.yaml, which fails as a no-op rather than an
+    # error. _load_ros_parameters returns a genuine nested dict (it collapses only
+    # the top-level node-name key, despite saying "flattening"), so mutating in
+    # place is safe; launch_ros dots the keys later when it serialises the params
+    # file. KeyError here is intentional if base.yaml loses the entry.
+    params['subscribers']['dlio_cloud']['topic_name'] = deskewed_cloud_topic
     params['map_frame'] = map_frame_id
     params['base_frame'] = base_frame_id
     params['corrected_map_frame'] = map_frame_id

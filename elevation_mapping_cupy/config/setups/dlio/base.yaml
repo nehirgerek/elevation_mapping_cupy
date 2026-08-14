@@ -16,15 +16,52 @@
 # established in acl-mapping's global_mapper_travel.launch.py for
 # travel_ros's non-wildcard kitti_params.yaml).
 #
-# topic_name/map_frame/base_frame/corrected_map_frame below are placeholders:
-# elevation_mapping_dlio.launch.py overrides all of them based on its `quad`
-# launch argument before passing this to the node.
+# map_frame/base_frame/corrected_map_frame below are placeholders, as is
+# dlio_cloud's topic_name: elevation_mapping_dlio.launch.py overrides them based
+# on its `quad` launch argument before passing this to the node. The subscriber
+# LIST is authoritative HERE though -- that launch file mutates only dlio_cloud's
+# topic_name, so subscribers added below are picked up as written.
 /**:
   ros__parameters:
     subscribers:
       dlio_cloud:
         topic_name: 'dlio/odom_node/pointcloud/deskewed'
         data_type: pointcloud
+
+      # RealSense D455 depth cloud, fused into the same map as the lidar.
+      #
+      # Stamped d455_depth_optical_frame, which is NOT the map frame, so
+      # pointcloud_callback takes the TF-transform branch: points are placed via a
+      # map_frame <- d455_depth_optical_frame lookup at the message stamp, and the
+      # validity gate (max_height_range) and noise model (sensor_noise_factor *
+      # range^2) are evaluated against the CAMERA's origin rather than the lidar's.
+      # That per-sensor correctness is exactly why this is a SECOND SUBSCRIBER and
+      # not a cloud pre-merged into dlio_cloud: the node has one global
+      # sensor_frame and no per-subscriber extrinsics, so a merged cloud stamped
+      # in the map frame would silently gate and weight camera points against the
+      # lidar, and ray-cast them from the lidar.
+      #
+      # Relative topic, resolved against this node's namespace (= quad), so the
+      # entry stays correct for RR04/RR06 without hardcoding a robot name.
+      #
+      # Deliberately NO `channels:`. Without it the callback takes the
+      # _pointcloud2_xyz_f32 fast path, which reads x/y/z by declared offset with
+      # itemsize=point_step and therefore ignores this cloud's rgb field at offset
+      # 16 for free. Setting channels would be slower (rnp.numpify) AND useless:
+      # this port implements no pointcloud semantic fusion at all --
+      # update_map_with_kernel slices points_all[:, :3] and never references its
+      # channels argument, and semantic_map is touched only on the image path.
+      d455_cloud:
+        topic_name: 'd455/depth/color/points'
+        data_type: pointcloud
+        # Drop the top of the camera's field of view. Those rays leave the
+        # (35 deg down-pitched) camera close to horizontal, graze the floor at
+        # long range, and carry nearly all of its error: measured against the
+        # Livox floor plane in base_link, 0.0-0.1% of points are worse than
+        # critical_step below 20 deg elevation, versus ~2.9% above it. This cut
+        # removes 94% of the bad points for 18% of the good ones. It only
+        # touches THIS subscriber -- the lidar is unaffected.
+        fov_elev_max_deg: 20.0
 
     map_frame: 'odom'
     base_frame: 'base_link'
