@@ -3,6 +3,7 @@ import math
 import message_filters
 import numpy as np
 import os
+from collections import deque
 from pathlib import Path
 from functools import partial
 from typing import Dict, List
@@ -43,6 +44,71 @@ PDC_DATATYPE = {
     "7": np.float32,
     "8": np.float64,
 }
+
+
+def make_planning_occupancy_grid(data: np.ndarray, max_small_size: int = 2) -> np.ndarray:
+    """Build a planning-only occupancy grid from a raw OccupancyGrid `data` array.
+
+    The raw tri-state convention is FREE=0, UNKNOWN=-1, OCCUPIED=100. Small isolated
+    pockets of UNKNOWN are traversable holes a planner can route through, but a large
+    contiguous UNKNOWN region is a genuine gap in perception that MIGHTY's HGP/A* must
+    treat as blocked. This returns a COPY where every 8-connected UNKNOWN component of
+    size > max_small_size is set to OCCUPIED (100); components of size <= max_small_size
+    are left as UNKNOWN (-1). FREE/OCCUPIED cells are untouched.
+
+    Classification is recomputed from scratch on every call -- there is no history. If a
+    later map shrinks a large UNKNOWN region down to <= max_small_size connected cells,
+    those cells are simply left as -1 again on the next call.
+
+    Complexity is ~O(number of grid cells): a single global `visited` mask means each
+    UNKNOWN cell is enqueued at most once, and each cell inspects a constant 8 neighbors,
+    so the flood fill is linear in the cell count regardless of component shapes/sizes.
+    `data` itself is never mutated (only the returned copy is written).
+    """
+    UNKNOWN = -1
+    OCCUPIED = 100
+
+    planning = data.copy()
+    height, width = data.shape
+    # One global visited mask over the whole grid, so each UNKNOWN cell is processed by
+    # exactly one BFS -- NOT a fresh BFS launched from every UNKNOWN cell.
+    visited = np.zeros((height, width), dtype=bool)
+    is_unknown = (data == UNKNOWN)
+
+    for start_r in range(height):
+        for start_c in range(width):
+            if not is_unknown[start_r, start_c] or visited[start_r, start_c]:
+                continue
+            # Flood the COMPLETE 8-connected UNKNOWN component containing this cell.
+            queue = deque()
+            queue.append((start_r, start_c))
+            visited[start_r, start_c] = True
+            component = [(start_r, start_c)]
+            is_large = len(component) > max_small_size
+            while queue:
+                r, c = queue.popleft()
+                r_lo = r - 1 if r > 0 else r
+                r_hi = r + 1 if r < height - 1 else r
+                c_lo = c - 1 if c > 0 else c
+                c_hi = c + 1 if c < width - 1 else c
+                for nr in range(r_lo, r_hi + 1):
+                    for nc in range(c_lo, c_hi + 1):
+                        if nr == r and nc == c:
+                            continue
+                        if is_unknown[nr, nc] and not visited[nr, nc]:
+                            visited[nr, nc] = True
+                            queue.append((nr, nc))
+                            component.append((nr, nc))
+                            # Third cell found: mark large, but keep flooding so the ENTIRE
+                            # component is discovered and can be blocked together.
+                            if len(component) > max_small_size:
+                                is_large = True
+            if is_large:
+                for r, c in component:
+                    planning[r, c] = OCCUPIED
+
+    return planning
+
 
 def _pointcloud2_xyz_f32(msg: PointCloud2) -> np.ndarray:
     """
@@ -228,6 +294,18 @@ class ElevationMappingNode(Node):
             ('esdf_grid_layer', 'esdf_encoded'),
             ('esdf_grid_fps', 5.0),
             ('esdf_grid_enable', True),
+            # Second occupancy output for MIGHTY's HGP/A* planner. Derived from the EXACT
+            # same occupancy update as occ_2d_topic (same stamp/frame/resolution/size/origin),
+            # then large (>= planning_unknown_max_traversable_cells + 1, 8-connected) UNKNOWN
+            # regions are turned into OCCUPIED so the planner treats perception gaps as blocked.
+            # The raw occ_2d_topic (frontier detection) is left byte-for-byte unchanged.
+            # Same relative-name / namespace behavior as occ_2d_topic -> resolves to e.g.
+            # /RR08/planning_occ_2d_topic (no hard-coded namespace).
+            ('planning_occupancy_grid_enable', True),
+            ('planning_occupancy_grid_topic', 'planning_occ_2d_topic'),
+            # UNKNOWN components of <= this many 8-connected cells are traversable (left -1);
+            # components of >= this + 1 (i.e. >= 5) are blocked as OCCUPIED for the planner.
+            ('planning_unknown_max_traversable_cells', 4),
         ):
             if not self.has_parameter(name):
                 self.declare_parameter(name, default)
@@ -241,6 +319,9 @@ class ElevationMappingNode(Node):
         self.esdf_grid_layer = self.get_parameter('esdf_grid_layer').get_parameter_value().string_value
         self.esdf_grid_fps = float(self.get_parameter('esdf_grid_fps').value)
         self.esdf_grid_enable = bool(self.get_parameter('esdf_grid_enable').value)
+        self.planning_occupancy_grid_enable = bool(self.get_parameter('planning_occupancy_grid_enable').value)
+        self.planning_occupancy_grid_topic = self.get_parameter('planning_occupancy_grid_topic').get_parameter_value().string_value
+        self.planning_unknown_max_traversable_cells = int(self.get_parameter('planning_unknown_max_traversable_cells').value)
         self.initialize_tf_grid_size = self.get_parameter('initialize_tf_grid_size').get_parameter_value().double_value
         self.map_acquire_fps = self.get_parameter('map_acquire_fps').get_parameter_value().double_value
         self.publish_statistics_fps = self.get_parameter('publish_statistics_fps').get_parameter_value().double_value
@@ -507,6 +588,10 @@ class ElevationMappingNode(Node):
         """
         self._occupancy_publishers = {}
         self._occupancy_timers = []
+        # Second occupancy output for MIGHTY planning, published in lock-step with the raw
+        # occ_2d_topic from the same publish_occupancy_grid() call (see below). None unless
+        # both the base occupancy publisher and the planning output are enabled.
+        self._planning_occupancy_publisher = None
         if self.occupancy_grid_enable:
             # Plain relative name -> ROS2 applies only this node's own namespace (e.g.
             # /RR08/occ_2d_topic), matching how global_mapper_ros's occ_2d_pub_ and Mighty's
@@ -517,6 +602,16 @@ class ElevationMappingNode(Node):
             )
             publisher = self.create_publisher(OccupancyGrid, topic_name, 10)
             self._occupancy_publishers[self.occupancy_grid_layer] = publisher
+            # Planning occupancy shares the SAME relative-name / namespace resolution as the
+            # raw occupancy topic (no hard-coded RR08) -> e.g. /RR08/planning_occ_2d_topic.
+            if self.planning_occupancy_grid_enable:
+                planning_topic_name = (
+                    self.planning_occupancy_grid_topic if self.occupancy_grid_root_relative
+                    else f"{self.get_fully_qualified_name()}/{self.planning_occupancy_grid_topic}"
+                )
+                self._planning_occupancy_publisher = self.create_publisher(
+                    OccupancyGrid, planning_topic_name, 10
+                )
             timer = self.create_timer(
                 1.0 / self.occupancy_grid_fps,
                 partial(self.publish_occupancy_grid, layer_name=self.occupancy_grid_layer)
@@ -539,7 +634,20 @@ class ElevationMappingNode(Node):
         if self._map_q is None:
             return
         publisher = self._occupancy_publishers.get(layer_name)
-        if publisher is None or publisher.get_subscription_count() == 0:
+        # The planning grid is a derivative of the raw occupancy layer only, published from
+        # this same invocation. Whether we do the (cheap) extra work is decided per-publisher
+        # by subscriber count -- the two publishers are independent: the planning grid must
+        # still publish when it alone has a subscriber, and the raw grid must still publish
+        # when it alone has a subscriber. Neither depends on the other having subscribers.
+        planning_publisher = (
+            self._planning_occupancy_publisher
+            if layer_name == self.occupancy_grid_layer else None
+        )
+        raw_wanted = publisher is not None and publisher.get_subscription_count() > 0
+        planning_wanted = (
+            planning_publisher is not None and planning_publisher.get_subscription_count() > 0
+        )
+        if not raw_wanted and not planning_wanted:
             return
         try:
             # TEMPORARY diagnostic instrumentation -- see initialize_elevation_mapping.
@@ -597,8 +705,27 @@ class ElevationMappingNode(Node):
         msg.info.origin.position.y = float(center[1]) - actual_map_length_y / 2.0
         msg.info.origin.position.z = 0.0
         msg.info.origin.orientation.w = 1.0
-        msg.data = data.flatten().tolist()
-        publisher.publish(msg)
+        # Raw occupancy output (frontier detection) -- left EXACTLY as before. Publish only
+        # when it has a subscriber, preserving the original subscriber-gated behavior.
+        if raw_wanted:
+            msg.data = data.flatten().tolist()
+            publisher.publish(msg)
+
+        # Second occupancy output for MIGHTY HGP/A* planning. Derived from the identical
+        # occupancy update (same stamp/frame/resolution/size/origin) as the raw grid; only
+        # the cell values differ (large UNKNOWN components -> OCCUPIED). Recomputed fresh
+        # every call, no persistence. `data` (the raw array) is never mutated.
+        if planning_wanted:
+            planning_data = make_planning_occupancy_grid(
+                data, self.planning_unknown_max_traversable_cells
+            )
+            planning_msg = OccupancyGrid()
+            # Reuse the raw grid's header/info verbatim so the two outputs are byte-identical
+            # in stamp, frame_id, resolution, width/height, and origin.
+            planning_msg.header = msg.header
+            planning_msg.info = msg.info
+            planning_msg.data = planning_data.flatten().tolist()
+            planning_publisher.publish(planning_msg)
 
     def register_timers(self) -> None:
         self.time_pose_update = self.create_timer(
