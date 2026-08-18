@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import array
 import math
 import message_filters
 import numpy as np
@@ -686,7 +687,10 @@ class ElevationMappingNode(Node):
         # Raw occupancy output (frontier detection) -- left EXACTLY as before. Publish only
         # when it has a subscriber, preserving the original subscriber-gated behavior.
         if raw_wanted:
-            msg.data = data.flatten().tolist()
+            # array.array('b', bytes) is a C-level copy into the int8[] field -- avoids
+            # building height*width Python int objects the way .tolist() does, which was
+            # the dominant per-publish cost on the Orin (esp. at map_length=60 -> 360k cells).
+            msg.data = array.array('b', data.astype(np.int8, copy=False).tobytes())
             publisher.publish(msg)
 
         # Second occupancy output for MIGHTY HGP/A* planning. Derived from the identical
@@ -702,7 +706,7 @@ class ElevationMappingNode(Node):
             # in stamp, frame_id, resolution, width/height, and origin.
             planning_msg.header = msg.header
             planning_msg.info = msg.info
-            planning_msg.data = planning_data.flatten().tolist()
+            planning_msg.data = array.array('b', planning_data.astype(np.int8, copy=False).tobytes())
             planning_publisher.publish(planning_msg)
 
     def register_timers(self) -> None:
