@@ -196,14 +196,33 @@ occupancy:
     traversability_layer_name: "geom_traversability"
     measured_validity_layer: "elevation"
     variance_layer: "variance"
-    # UNVERIFIED placeholder: real observed variance on this map ranges from ~0.06 (best
-    # case, well-observed flat ground) up to the initial/never-observed default of 1000 (see
-    # core_param.yaml initial_variance) with a post-update cap of max_variance=100. Gates only
-    # the FREE side of evidence here (see persistent_occupancy.py) -- a confident hazard
-    # reading is never suppressed by high variance, matching this pipeline's existing
-    # principle (curbs/edges legitimately carry higher variance than flat ground).
-    maximum_variance: 50.0
-    lethal_traversability_threshold: 0.35
+    # Range-gated trust horizon. Cell variance grows as sensor_noise_factor * range^2
+    # (core_param.yaml: 0.05), so this threshold is a distance cutoff in disguise:
+    #   r = sqrt(maximum_variance / 0.05)  ->  5.0 = ~10m, 11.25 = ~15m, 100.0 = ~45m
+    #
+    # Was 100.0, which is EXACTLY core_param.yaml's post-update max_variance clamp, so the
+    # `variance > maximum_variance` test could never fire for an observed cell: the gate was
+    # a no-op and nothing anywhere rejected far-field readings by range. Measured effect on
+    # RR08 (2026-08-12) -- occupied share of CLASSIFIED cells by distance from the robot:
+    # ~35% at 0-2m, 57% at 4-6m, 64% at 12-14m, 66% at 16-18m, 94% at 22-24m. Beyond ~10m
+    # the MID-360's returns are too sparse for geom_traversability to mean anything, so the
+    # map filled with phantom obstacles and unknown space was consumed prematurely (which
+    # also starved Mighty's frontier detector -- see mighty exploration notes).
+    #
+    # 5.0 keeps the trust horizon (~10m) well inside max_ray_length: 15.0, so anything we
+    # do trust can still be corrected later by visibility cleanup.
+    #
+    # Gates the FREE side of evidence (see persistent_occupancy.py).
+    maximum_variance: 10.0
+    # Same trust horizon applied to the OCCUPIED side. Without this the hazard path was
+    # completely ungated, so a single sparse far-field return could stamp a permanent
+    # phantom obstacle. Kept equal to maximum_variance so both directions share one
+    # horizon (~10m): past it a cell produces NO evidence at all and stays UNKNOWN, which
+    # is both honest about sensor capability and what Mighty's frontier detector needs.
+    # Raise it (with maximum_variance) if real obstacles are being missed at range; set
+    # <= 0 to disable the gate entirely and restore the original ungated hazard path.
+    hazard_maximum_variance: 5.0
+    lethal_traversability_threshold: 0.40
     # Hysteresis evidence-accumulation parameters (see persistent_occupancy.py's module
     # docstring for the full model). No time-decay term exists -- a cell's confidence only
     # moves when THIS cycle produced direct occupied or free evidence for it.
@@ -214,19 +233,21 @@ occupancy:
     #     decided cell).
     #   minimum_confidence / maximum_confidence: hard clamp on the accumulator.
     #
-    # Tuned for reactivity over stability (explicit tradeoff): minimum_confidence ==
-    # free_threshold and maximum_confidence == occupied_threshold, and both increment/
-    # decrement exceed the full confidence range. That means a SINGLE confidently-hazardous
-    # or reliably-free cycle immediately saturates the accumulator to the opposite boundary
-    # and flips the stored state right away, regardless of how much history the cell had
-    # accumulated in the other direction -- a newly-appeared obstacle or a newly-vacated cell
-    # shows up on the very next cycle instead of taking 3-4 cycles to overcome prior evidence.
-    # Missing/uncertain/high-variance cycles still leave confidence (and state) untouched, so
-    # this doesn't reintroduce the original stateless-flicker bug -- it only removes the
-    # extra corroboration requirement for cycles that DO produce confident evidence. If this
-    # proves too twitchy on noisy single-frame readings in practice, widen the gap between
-    # minimum_confidence/maximum_confidence and the thresholds (and/or lower the increment/
-    # decrement back below the full range) to require 2+ corroborating cycles again.
+    # Reactivity-first tuning, DELIBERATELY KEPT: minimum_confidence == free_threshold and
+    # maximum_confidence == occupied_threshold, with increment/decrement exceeding the full
+    # confidence range, so a single confident cycle flips the stored state immediately.
+    #
+    # A corroboration-based tuning (increment/decrement 1.0, clamps +/-6.0) was tried on
+    # 2026-08-12 to suppress far-field phantom obstacles and REVERTED: it made clearing a
+    # confirmed occupied cell take 8 cycles (~3.4s at the measured ~2.4Hz occupancy rate)
+    # instead of 1, which was clearly visible as sluggish updates in the near field. That
+    # is the wrong trade -- corroboration is a global brake applied to a problem that only
+    # exists at range, and it costs the most where the data is best.
+    #
+    # The far-field noise is handled instead by the two variance range gates above
+    # (maximum_variance / hazard_maximum_variance), which reject bad evidence at the source
+    # rather than slowing down every cell's response to good evidence. Keep it that way: if
+    # phantom obstacles reappear, tighten the horizons, don't slow the hysteresis.
     occupied_increment: 4.0
     free_decrement: 4.0
     occupied_threshold: 2.0
