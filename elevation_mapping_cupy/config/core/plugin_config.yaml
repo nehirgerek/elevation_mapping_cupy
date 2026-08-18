@@ -40,7 +40,7 @@ positive_spike_filter:
     spike_height_diff_m: 0.35
     support_height_tolerance_m: 0.12
     max_support_neighbor_count: 1
-    max_component_cells: 4
+    max_component_cells: 2
 # A second narrower cleanup pass catches the smaller shovel-local residual bumps
 # that survive the coarse tower filter while still preserving supported walls.
 positive_spike_filter_cleanup:
@@ -55,7 +55,7 @@ positive_spike_filter_cleanup:
     spike_height_diff_m: 0.08
     support_height_tolerance_m: 0.02
     max_support_neighbor_count: 1
-    max_component_cells: 2
+    max_component_cells: 1
     edge_invalid_neighbor_count_min: 3
     edge_peak_diff_m: 0.12
     edge_similarity_tolerance_m: 0.05
