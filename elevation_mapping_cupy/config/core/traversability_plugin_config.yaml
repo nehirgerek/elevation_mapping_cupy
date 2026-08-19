@@ -221,7 +221,7 @@ occupancy:
     # is both honest about sensor capability and what Mighty's frontier detector needs.
     # Raise it (with maximum_variance) if real obstacles are being missed at range; set
     # <= 0 to disable the gate entirely and restore the original ungated hazard path.
-    hazard_maximum_variance: 5.0
+    hazard_maximum_variance: 10.0
     lethal_traversability_threshold: 0.40
     # Hysteresis evidence-accumulation parameters (see persistent_occupancy.py's module
     # docstring for the full model). No time-decay term exists -- a cell's confidence only
